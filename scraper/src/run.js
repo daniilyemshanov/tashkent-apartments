@@ -53,10 +53,27 @@ const EXCHANGE_RATE_USD_UZS = Number(process.env.EXCHANGE_RATE_USD_UZS) || 12700
 const PHONE_REUSE_AGENT_THRESHOLD = 2;
 
 // Между вызовами extractListingInfo (LLM) — пауза, чтобы не упереться
-// в лимит бесплатного тира Gemini (10 запросов/мин на момент внедрения,
-// см. обсуждение в чате). 7с даёт ~8-9 запросов/мин с запасом — если
-// лимит Google в будущем изменится, это первое место для правки.
-const LLM_EXTRACT_DELAY_MS = Number(process.env.LLM_EXTRACT_DELAY_MS) || 7000;
+// в лимит бесплатного тира Gemini (10 запросов/мин). БЫЛО 7000мс
+// (~8.5 запросов/мин с запасом) — но это означало, что при большом
+// числе НОВЫХ объявлений за один прогон (после паузы, наплыва и т.п.)
+// скрапер не успевал пройти все source×propertyType×dealType
+// комбинации за timeout-minutes из scrape.yml: пауза применяется на
+// каждое новое объявление, пока circuit breaker явно не отключит
+// Gemini на этот прогон (после 3 подряд 429/402), а не только когда
+// Gemini реально отвечает — то есть почти всегда, даже если конкретный
+// вызов в итоге обслужил Groq/Mistral/... .
+// 13.09.2026: снижено до 2000мс (~30 запросов/мин) — это ЧАЩЕ лимита
+// Gemini, но это осознанно: как только квота исчерпана, 429 приходят
+// быстро (не таймаутом) и почти гарантированно ПОДРЯД, так что breaker
+// в aiProviders.js отключает Gemini на весь остаток прогона за 3
+// быстрых неудачных попытки — и дальше вся очередь новых объявлений
+// идёт через быстрые провайдеры без всякой паузы вообще (см. ветку
+// LLM_EXTRACT_DELAY_MS_NO_GEMINI ниже). Цена — горстка потраченных
+// впустую (но быстрых) 429-запросов к Gemini один раз за прогон,
+// вместо многих минут искусственного ожидания на каждом объявлении.
+// Если понадобится точнее настроить — можно переопределить через
+// секрет LLM_EXTRACT_DELAY_MS в GitHub Actions (env уже прокинут).
+const LLM_EXTRACT_DELAY_MS = Number(process.env.LLM_EXTRACT_DELAY_MS) || 2000;
 // Как только Gemini отключается circuit breaker'ом на этот прогон
 // (см. aiProviders.js) — длинная пауза больше не нужна, она была
 // нужна только ради его лимита. Groq/OpenRouter не настолько строгие,
@@ -870,65 +887,95 @@ const DOMTUT_PROPERTY_TYPES = ['apartment', 'house', 'commercial'];
 // scrapers/joymee.js).
 const JOYMEE_PROPERTY_TYPES = ['apartment', 'house', 'commercial'];
 
+// 13.09.2026: разбивка прогона на 2 параллельных job'а в scrape.yml
+// (matrix по dealType — sale/rent), т.к. даже после снижения
+// LLM_EXTRACT_DELAY_MS одного job'а на всё (30 комбинаций
+// source×propertyType×dealType подряд) может не хватать при большом
+// числе новых объявлений. Намеренно делим ИМЕННО по dealType, а не по
+// источнику: кросс-source дедуп (makeEntityKey — то же объявление,
+// перевыложенное на разных сайтах) должен видеть уже сохранённые
+// записи ДО следующего источника, а это гарантировано только внутри
+// одного process, если он идёт строго последовательно. Деление по
+// источникам создало бы гонку: два параллельных job'а могли бы не
+// увидеть вставку друг друга и оба посчитать одно и то же объявление
+// новым. Деление по dealType этого риска не несёт — sale и rent
+// внутри каждого job'а по-прежнему обходятся строго последовательно.
+// DEAL_TYPE_FILTER не задан (пусто/undefined) — старое поведение,
+// обрабатываются оба типа сделки подряд в одном процессе (напр. для
+// локального запуска или ручного workflow_dispatch без matrix).
+const DEAL_TYPE_FILTER = process.env.DEAL_TYPE_FILTER || null;
+const RUN_SALE = DEAL_TYPE_FILTER !== 'rent';
+const RUN_RENT = DEAL_TYPE_FILTER !== 'sale';
+
 async function main() {
+  if (DEAL_TYPE_FILTER) {
+    console.log(`Прогон ограничен DEAL_TYPE_FILTER=${DEAL_TYPE_FILTER}`);
+  }
+
   // Пересчёт медиан цены за м² (если устарели/пусто) ДО обработки
   // объявлений этого прогона — см. marketStats.js. Затем сама таблица
   // грузится в память один раз (loadMarketStatsMap) и передаётся во
   // все processSource(), а не читается из базы на каждое объявление.
+  // Безопасно дублировать в обоих параллельных job'ах (sale/rent) —
+  // это идемпотентный upsert по group_key, без обращений к LLM.
   await refreshMarketStatsIfStale();
   const marketStatsMap = await loadMarketStatsMap();
 
   // Продажа — в приоритете, проверяем её первой в каждом цикле
-  for (const propertyType of OLX_PROPERTY_TYPES) {
-    await processSource(fetchOlxListings, fetchOlxDetails, 'olx', 'sale', fetchOlxSellerListingsCount, propertyType, marketStatsMap);
-    await olxDelay();
-  }
-  for (const propertyType of UYBOR_PROPERTY_TYPES) {
-    await processSource(fetchUyborListings, fetchUyborDetails, 'uybor', 'sale', null, propertyType, marketStatsMap);
-  }
-  if (REALTING_ENABLED) {
-    for (const propertyType of REALTING_PROPERTY_TYPES) {
-      await processSource(fetchRealtingListings, fetchRealtingDetails, 'realting', 'sale', null, propertyType, marketStatsMap);
+  if (RUN_SALE) {
+    for (const propertyType of OLX_PROPERTY_TYPES) {
+      await processSource(fetchOlxListings, fetchOlxDetails, 'olx', 'sale', fetchOlxSellerListingsCount, propertyType, marketStatsMap);
+      await olxDelay();
     }
-  }
-  if (DOMTUT_ENABLED) {
-    for (const propertyType of DOMTUT_PROPERTY_TYPES) {
-      await processSource(fetchDomtutListings, fetchDomtutDetails, 'domtut', 'sale', null, propertyType, marketStatsMap);
+    for (const propertyType of UYBOR_PROPERTY_TYPES) {
+      await processSource(fetchUyborListings, fetchUyborDetails, 'uybor', 'sale', null, propertyType, marketStatsMap);
     }
-  }
-  // Joymee: endpoint/поля подтверждены вживую 11.08.2026 (см. шапку
-  // scrapers/joymee.js) — продажа квартир/домов/коммерции (все три
-  // category/property_type подтверждены скриншотами DevTools). Фильтр
-  // "только собственники" реализован через advertiser_type в
-  // fetchJoymeeDetails (advertiser_type !== 1 → sellerNameLooksLikeAgent
-  // → агентства не уходят в Telegram, см. processSource выше).
-  for (const propertyType of JOYMEE_PROPERTY_TYPES) {
-    await processSource(fetchJoymeeListings, fetchJoymeeDetails, 'joymee', 'sale', null, propertyType, marketStatsMap);
+    if (REALTING_ENABLED) {
+      for (const propertyType of REALTING_PROPERTY_TYPES) {
+        await processSource(fetchRealtingListings, fetchRealtingDetails, 'realting', 'sale', null, propertyType, marketStatsMap);
+      }
+    }
+    if (DOMTUT_ENABLED) {
+      for (const propertyType of DOMTUT_PROPERTY_TYPES) {
+        await processSource(fetchDomtutListings, fetchDomtutDetails, 'domtut', 'sale', null, propertyType, marketStatsMap);
+      }
+    }
+    // Joymee: endpoint/поля подтверждены вживую 11.08.2026 (см. шапку
+    // scrapers/joymee.js) — продажа квартир/домов/коммерции (все три
+    // category/property_type подтверждены скриншотами DevTools). Фильтр
+    // "только собственники" реализован через advertiser_type в
+    // fetchJoymeeDetails (advertiser_type !== 1 → sellerNameLooksLikeAgent
+    // → агентства не уходят в Telegram, см. processSource выше).
+    for (const propertyType of JOYMEE_PROPERTY_TYPES) {
+      await processSource(fetchJoymeeListings, fetchJoymeeDetails, 'joymee', 'sale', null, propertyType, marketStatsMap);
+    }
   }
 
-  for (const propertyType of OLX_PROPERTY_TYPES) {
-    await processSource(fetchOlxListings, fetchOlxDetails, 'olx', 'rent', fetchOlxSellerListingsCount, propertyType, marketStatsMap);
-    await olxDelay();
-  }
-  for (const propertyType of UYBOR_PROPERTY_TYPES) {
-    await processSource(fetchUyborListings, fetchUyborDetails, 'uybor', 'rent', null, propertyType, marketStatsMap);
-  }
-  if (REALTING_ENABLED) {
-    for (const propertyType of REALTING_PROPERTY_TYPES) {
-      await processSource(fetchRealtingListings, fetchRealtingDetails, 'realting', 'rent', null, propertyType, marketStatsMap);
+  if (RUN_RENT) {
+    for (const propertyType of OLX_PROPERTY_TYPES) {
+      await processSource(fetchOlxListings, fetchOlxDetails, 'olx', 'rent', fetchOlxSellerListingsCount, propertyType, marketStatsMap);
+      await olxDelay();
     }
-  }
-  if (DOMTUT_ENABLED) {
-    for (const propertyType of DOMTUT_PROPERTY_TYPES) {
-      await processSource(fetchDomtutListings, fetchDomtutDetails, 'domtut', 'rent', null, propertyType, marketStatsMap);
+    for (const propertyType of UYBOR_PROPERTY_TYPES) {
+      await processSource(fetchUyborListings, fetchUyborDetails, 'uybor', 'rent', null, propertyType, marketStatsMap);
     }
-  }
-  // Joymee-аренда: deal_type=2 подтверждён вживую 11.08.2026 (см.
-  // JOYMEE_DEAL_TYPE в scrapers/joymee.js), квартиры/дом/коммерция для
-  // аренды тоже все подтверждены (см. JOYMEE_CATEGORY.rent в
-  // scrapers/joymee.js).
-  for (const propertyType of JOYMEE_PROPERTY_TYPES) {
-    await processSource(fetchJoymeeListings, fetchJoymeeDetails, 'joymee', 'rent', null, propertyType, marketStatsMap);
+    if (REALTING_ENABLED) {
+      for (const propertyType of REALTING_PROPERTY_TYPES) {
+        await processSource(fetchRealtingListings, fetchRealtingDetails, 'realting', 'rent', null, propertyType, marketStatsMap);
+      }
+    }
+    if (DOMTUT_ENABLED) {
+      for (const propertyType of DOMTUT_PROPERTY_TYPES) {
+        await processSource(fetchDomtutListings, fetchDomtutDetails, 'domtut', 'rent', null, propertyType, marketStatsMap);
+      }
+    }
+    // Joymee-аренда: deal_type=2 подтверждён вживую 11.08.2026 (см.
+    // JOYMEE_DEAL_TYPE в scrapers/joymee.js), квартиры/дом/коммерция для
+    // аренды тоже все подтверждены (см. JOYMEE_CATEGORY.rent в
+    // scrapers/joymee.js).
+    for (const propertyType of JOYMEE_PROPERTY_TYPES) {
+      await processSource(fetchJoymeeListings, fetchJoymeeDetails, 'joymee', 'rent', null, propertyType, marketStatsMap);
+    }
   }
   console.log('Проверка завершена.');
 
@@ -938,18 +985,26 @@ async function main() {
   // агентом в этом же прогоне выше, или вручную кнопкой "Это агент" в
   // Telegram). Старый мусор без сохранённого id сюда не попадает — для
   // него нужен разовый backfill-from-telegram-export.js.
-  try {
-    console.log('Автоочистка агентских сообщений...');
-    const { totalCandidates, deleted, failed, withoutIdCount } = await cleanAgentBacklog({ quiet: true });
-    if (totalCandidates > 0) {
-      console.log(
-        `Автоочистка: удалено ${deleted}, не удалось ${failed}, недостижимо (нет id) ${withoutIdCount} (из ${totalCandidates} кандидатов).`
-      );
-    } else {
-      console.log('Автоочистка: чистить нечего.');
+  // Выполняется ТОЛЬКО в job'е sale (не в rent и не когда фильтр не
+  // задан вообще — тогда это единственный job, ему можно) — очередь
+  // агентских сообщений общая для sale и rent (запрос не фильтрует по
+  // dealType), и если оба параллельных job'а полезут удалять одни и те
+  // же сообщения одновременно, второй словит ложный "не удалось
+  // удалить" на том, что первый уже успешно удалил.
+  if (!DEAL_TYPE_FILTER || DEAL_TYPE_FILTER === 'sale') {
+    try {
+      console.log('Автоочистка агентских сообщений...');
+      const { totalCandidates, deleted, failed, withoutIdCount } = await cleanAgentBacklog({ quiet: true });
+      if (totalCandidates > 0) {
+        console.log(
+          `Автоочистка: удалено ${deleted}, не удалось ${failed}, недостижимо (нет id) ${withoutIdCount} (из ${totalCandidates} кандидатов).`
+        );
+      } else {
+        console.log('Автоочистка: чистить нечего.');
+      }
+    } catch (err) {
+      console.error('Автоочистка агентских сообщений: ошибка:', err.message);
     }
-  } catch (err) {
-    console.error('Автоочистка агентских сообщений: ошибка:', err.message);
   }
 }
 
