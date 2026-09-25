@@ -3,3 +3,13 @@ dist/
 .env
 .vercel
 *.progress.json
+
+scraper.env.new
+scraper/.env.OLD_BACKUP
+*.env
+.env
+
+*.env
+*.env.*
+.env
+.env.*
