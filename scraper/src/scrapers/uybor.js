@@ -231,7 +231,7 @@ export async function fetchUyborListings(dealType = 'rent', propertyType = 'apar
       // описание, см. комментарий там) — поэтому ищем явную фразу
       // только в title. Реже сработает, чем на OLX, но лучше, чем
       // ничего, и безопасно молчит (null), если фразы нет — см.
-      // marketSegment.js и фолбэк в marketStats.js.
+      // marketSegment.js.
       market_segment: detectMarketSegment(title),
     });
   }

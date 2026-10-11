@@ -1,89 +1,69 @@
-import axios from 'axios';
+// ============================================================================
+// ИИ-слой проекта: ОДИН платный основной провайдер + ОДИН бесплатный запасной.
+//
+//   1) Claude Haiku 5.5 (Anthropic)  — основной, платный, быстрый, стабильный
+//   2) Mistral (mistral-small-latest) — запасной, бесплатный (опционально)
+//
+// Раньше здесь была цепочка из шести бесплатных провайдеров (Gemini, Groq,
+// OpenRouter, Mistral, SambaNova, Cloudflare) — их ломали квоты, снятые с
+// обслуживания модели и 402. Теперь цепочка короткая и предсказуемая.
+//
+// ВАЖНО: файл существует в ДВУХ копиях, которые должны быть ИДЕНТИЧНЫ
+// (разные деплой-юниты, общего import-пути нет):
+//   scraper/src/aiProviders.js   — скрапер (GitHub Actions / VPS)
+//   client/api/_aiProviders.js   — Vercel (ИИ-поиск на сайте, /search в боте)
+// Проверка одной командой из корня репозитория:
+//   diff scraper/src/aiProviders.js client/api/_aiProviders.js
+//
+// Публичный интерфейс не изменился (runAiJsonChain, providerPlan,
+// isProviderActiveThisRun) — вызывающий код править не нужно.
+//
+// Особенности Claude Haiku 5.5 (по официальному migration guide):
+//  * temperature/top_p/top_k и prefill ассистента возвращают 400 — НЕ шлём.
+//  * Adaptive thinking включён по умолчанию, токены размышления входят в
+//    max_tokens, а ответ может начинаться с блока "thinking" — поэтому текст
+//    собираем из блоков type:"text", а не берём content[0].
+//  * Глубину размышления задаёт output_config.effort ("low" для простых
+//    задач извлечения полей — быстрее и дешевле).
+// ============================================================================
 
-const AI_FALLBACK_ENABLED = process.env.AI_FALLBACK_ENABLED === 'true';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
-const SAMBANOVA_API_KEY = process.env.SAMBANOVA_API_KEY;
-const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
-const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_VERSION = '2023-06-01';
+const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions';
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
-// llama-3.3-70b-versatile официально задепрекейчен Groq 17.06.2026
-// (см. console.groq.com/docs/deprecations) — вызовы к нему теперь
-// падают с 404 model_decommissioned. Актуальная замена по
-// рекомендации Groq — openai/gpt-oss-120b.
-const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
-// Cerebras убран из цепочки (19.08.2026) — их бесплатный тариф стал
-// разовым $5-кредитом вместо постоянного free tier, на аккаунте
-// проекта исчерпан (стабильные 402 Payment Required), без привязки
-// карты не восстановится. Раз не работает и чинить нечем — выпилен
-// целиком, а не оставлен как мёртвое звено, которое сначала падает на
-// каждом объявлении и только потом идёт дальше по цепочке (даже с
-// circuit breaker'ом это лишние 3 неудачных запроса в начале КАЖДОГО
-// прогона, пока breaker снова не сработает).
-// openai/gpt-4o-mini — платная модель, на аккаунте без пополнения
-// упадёт с 402 (Payment Required). openrouter/free — встроенный
-// авто-роутер OpenRouter: сам подбирает
-// бесплатную модель из текущего живого списка (список :free-моделей
-// у OpenRouter регулярно меняется, поэтому жёстко прибивать
-// конкретный id вроде "meta-llama/llama-3.3-70b:free" рискованно —
-// такие id периодически снимают с бесплатного тарифа без предупреждения).
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'openrouter/free';
-// Mistral Experiment tier — 1 млрд токенов/мес бесплатно, самый
-// щедрый постоянный (не разовый) лимит из всех провайдеров в цепочке.
-// mistral-small-latest — не reasoning-модель, поэтому reasoning_effort
-// ей не нужен и "empty response" из-за исчерпанного лимита токенов
-// на размышления ей не грозит.
-const MISTRAL_MODEL = process.env.MISTRAL_MODEL || 'mistral-small-latest';
-// SambaNova Cloud free developer tier — без карты, 600 RPM.
-// Llama-3.3-70B-Instruct — не reasoning-модель (в отличие от их же
-// gpt-oss на этом провайдере), так что reasoning_effort ей не нужен и
-// пустых ответов из-за токенов на размышления можно не бояться.
-// Независимая от остальных провайдеров инфраструктура — свои чипы
-// (RDU), не переиспользует чужие GPU-облака, как многие агрегаторы.
-const SAMBANOVA_MODEL = process.env.SAMBANOVA_MODEL || 'Meta-Llama-3.3-70B-Instruct';
-// Cloudflare Workers AI free tier — 10 000 "нейронов"/день (это
-// порядка 1000+ ответов в день для 8B-модели), без привязки карты.
-// Требует ДВА значения, не один ключ: CLOUDFLARE_ACCOUNT_ID (виден в
-// дашборде Cloudflare) и CLOUDFLARE_API_TOKEN. Инфраструктура —
-// edge-сеть Cloudflare, ещё один независимый источник отказа.
-// llama-3.1-8b-instruct-fast (а не обычный llama-3.1-8b-instruct без
-// -fast) — Cloudflare задепрекейчила базовый вариант 30.05.2026 (см.
-// developers.cloudflare.com/changelog/post/2026-05-08-planned-model-deprecations/),
-// вызовы к нему падают с 410 Gone. -fast и -lora варианты остались
-// активными и это официально рекомендованный путь миграции.
-const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_MODEL || '@cf/meta/llama-3.1-8b-instruct-fast';
+// max_tokens у Anthropic ограничивает размышления + текст. Billing идёт по
+// фактически сгенерированным токенам, а не по лимиту, поэтому запас ничего
+// не стоит, но защищает от пустого ответа (stop_reason: max_tokens).
+const THINKING_HEADROOM_TOKENS = 1024;
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS) || 15000;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504, 529]);
+const ANTHROPIC_MAX_ATTEMPTS = 2; // 1 повтор на 429/5xx/529, потом запасной
+const MAX_RETRY_WAIT_MS = 3000;
 
-// Мини circuit breaker на весь прогон: если провайдер падает по
-// 429 (квота/рейт-лимит) или 402 (нет денег на счету) несколько раз
-// подряд, это почти наверняка не восстановится до следующего запуска
-// через 15 минут — нет смысла ходить к нему на КАЖДОМ объявлении и
-// ждать таймаут/ретрай. Отключаем его до конца текущего прогона, и
-// цепочка сразу идёт к следующему провайдеру, экономя секунды на
-// каждое объявление (при 40+ объявлениях за прогон это минуты).
-const CIRCUIT_BREAKER_STATUSES = new Set([429, 402]);
-const CIRCUIT_BREAKER_THRESHOLD = 3;
-const providerFailureStreak = new Map();
-const providerDisabledForRun = new Set();
+// Если основной провайдер "лёг" надолго (неверный ключ, кончились деньги,
+// повторные 429) — не долбим его на каждом объявлении, а на 10 минут идём
+// сразу к запасному. Через 10 минут пробуем снова (в serverless-инстансе
+// состояние живёт недолго, в скрапере — не дольше одного прогона).
+const DISABLE_FOR_MS = 10 * 60 * 1000;
+const RATE_LIMIT_STREAK_LIMIT = 3;
+const disabledUntil = new Map(); // name -> timestamp
+const rateLimitStreak = new Map(); // name -> число 429 подряд
 
-function noteProviderResult(name, err) {
-  const status = err?.response?.status;
-  if (status && CIRCUIT_BREAKER_STATUSES.has(status)) {
-    const streak = (providerFailureStreak.get(name) || 0) + 1;
-    providerFailureStreak.set(name, streak);
-    if (streak >= CIRCUIT_BREAKER_THRESHOLD) {
-      providerDisabledForRun.add(name);
-    }
-  } else {
-    providerFailureStreak.set(name, 0);
-  }
+function cfg() {
+  // Читаем ENV в момент вызова (а не при импорте) — проще тестировать и
+  // подхватывает значения, заданные после загрузки dotenv.
+  return {
+    anthropicKey: process.env.ANTHROPIC_API_KEY,
+    anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5',
+    // '' (пустая строка) = не отправлять output_config вообще (на случай,
+    // если ANTHROPIC_MODEL переопределён на модель без поддержки effort).
+    anthropicEffort: process.env.ANTHROPIC_EFFORT ?? 'low',
+    mistralKey: process.env.MISTRAL_API_KEY,
+    mistralModel: process.env.MISTRAL_MODEL || 'mistral-small-latest',
+    fallbackEnabled: process.env.AI_FALLBACK_ENABLED === 'true',
+  };
 }
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
-const PROVIDER_DELAY_MS = 250;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -102,97 +82,161 @@ function parseJsonResponse(text) {
   return JSON.parse(cleanJsonText(text));
 }
 
-function isRetryableError(err) {
-  const status = err?.response?.status;
-  if (status && !RETRYABLE_STATUSES.has(status)) return false;
-  return true;
+async function httpPostJson(url, headers, body, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const bodyText = await res.text();
+    if (!res.ok) {
+      const err = new Error(`HTTP ${res.status}`);
+      err.response = {
+        status: res.status,
+        text: bodyText,
+        retryAfter: res.headers?.get?.('retry-after') ?? null,
+      };
+      throw err;
+    }
+    return JSON.parse(bodyText);
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      const e = new Error(`timeout ${timeoutMs}ms`);
+      e.isTimeout = true;
+      throw e;
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
-async function callGemini({ model, systemPrompt, userText, timeoutMs, maxTokens = 300 }) {
+async function callAnthropic({ systemPrompt, userText, timeoutMs, maxTokens }) {
+  const c = cfg();
+  const body = {
+    model: c.anthropicModel,
+    max_tokens: maxTokens + THINKING_HEADROOM_TOKENS,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userText }],
+    // Никаких temperature/top_p/top_k и prefill — на Haiku 5.5 это 400.
+    ...(c.anthropicEffort ? { output_config: { effort: c.anthropicEffort } } : {}),
+  };
+  const headers = { 'x-api-key': c.anthropicKey, 'anthropic-version': ANTHROPIC_VERSION };
+
   let lastError = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
+  for (let attempt = 1; attempt <= ANTHROPIC_MAX_ATTEMPTS; attempt++) {
     try {
-      const response = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        {
-          system_instruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ parts: [{ text: userText }] }],
-          // temperature/top_p/top_k официально задепрекейчены для
-          // текущих Gemini flash-моделей — не отправляем их.
-          // thinkingConfig.thinkingLevel: 'low' — по умолчанию у этих
-          // моделей thinkingLevel medium (модель "размышляет" перед
-          // ответом), что для простых задач извлечения полей избыточно
-          // и было реальной причиной таймаутов (см. историю проекта).
-          generationConfig: {
-            responseMimeType: 'application/json',
-            maxOutputTokens: maxTokens,
-            thinkingConfig: { thinkingLevel: 'low' },
-          },
-        },
-        {
-          headers: { 'content-type': 'application/json' },
-          params: { key: GEMINI_API_KEY },
-          timeout: timeoutMs,
-        }
-      );
-      const text = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!text) throw new Error('empty response');
-      return parseJsonResponse(text);
+      const data = await httpPostJson(ANTHROPIC_URL, headers, body, timeoutMs);
+      // Ответ может начинаться с блока thinking — берём только text-блоки.
+      const blocks = Array.isArray(data?.content) ? data.content : [];
+      const text = blocks
+        .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join('');
+      if (!text.trim()) {
+        throw new Error(
+          data?.stop_reason === 'max_tokens'
+            ? 'max_tokens исчерпан до появления текста (размышления)'
+            : `empty response (stop_reason=${data?.stop_reason ?? '?'})`
+        );
+      }
+      return {
+        data: parseJsonResponse(text),
+        usage: { input: data?.usage?.input_tokens ?? null, output: data?.usage?.output_tokens ?? null },
+      };
     } catch (err) {
       lastError = err;
       const status = err?.response?.status;
-      const retryable = !status || RETRYABLE_STATUSES.has(status);
-      if (attempt === 2 || !retryable) break;
-      await sleep(800);
+      // Повторяем только 429/5xx/529. Таймаут не повторяем — это съело бы
+      // бюджет времени (на Vercel лимит функции 60 с), идём к запасному.
+      const retryable = status && RETRYABLE_STATUSES.has(status);
+      if (attempt === ANTHROPIC_MAX_ATTEMPTS || !retryable) break;
+      const ra = Number(err.response.retryAfter);
+      await sleep(Math.min(MAX_RETRY_WAIT_MS, Number.isFinite(ra) && ra > 0 ? ra * 1000 : 600));
     }
   }
-  throw lastError || new Error('gemini failed');
+  throw lastError || new Error('anthropic failed');
 }
 
-async function callOpenAICompatible({ baseUrl, apiKey, model, systemPrompt, userText, timeoutMs, maxTokens = 300, extraHeaders = {}, extraBody = {} }) {
-  const response = await axios.post(
-    `${baseUrl.replace(/\/$/, '')}/chat/completions`,
+async function callMistral({ systemPrompt, userText, timeoutMs, maxTokens }) {
+  const c = cfg();
+  const data = await httpPostJson(
+    MISTRAL_URL,
+    { Authorization: `Bearer ${c.mistralKey}` },
     {
-      model,
+      model: c.mistralModel,
       max_tokens: maxTokens,
       temperature: 0,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userText },
       ],
-      ...extraBody,
     },
-    {
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-        ...extraHeaders,
-      },
-      timeout: timeoutMs,
-    }
+    timeoutMs
   );
-  const text = response.data?.choices?.[0]?.message?.content;
+  const text = data?.choices?.[0]?.message?.content;
   if (!text) throw new Error('empty response');
-  return parseJsonResponse(text);
+  return {
+    data: parseJsonResponse(text),
+    usage: { input: data?.usage?.prompt_tokens ?? null, output: data?.usage?.completion_tokens ?? null },
+  };
+}
+
+function noteFailure(name, err) {
+  const status = err?.response?.status;
+  const text = String(err?.response?.text || '');
+
+  // Деньги кончились: Anthropic отвечает 400 "credit balance is too low".
+  const billing = status === 400 && /credit balance/i.test(text);
+  if (status === 401 || status === 403 || billing || status === 402) {
+    disabledUntil.set(name, Date.now() + DISABLE_FOR_MS);
+    console.error(
+      `AI: ${name} отключён на ${DISABLE_FOR_MS / 60000} мин — ` +
+        (billing || status === 402
+          ? 'НЕТ ДЕНЕГ НА СЧЕТУ, пополните баланс в консоли провайдера'
+          : `ключ неверный/отозван (HTTP ${status})`)
+    );
+    return;
+  }
+  if (status === 429) {
+    const streak = (rateLimitStreak.get(name) || 0) + 1;
+    rateLimitStreak.set(name, streak);
+    if (streak >= RATE_LIMIT_STREAK_LIMIT) {
+      disabledUntil.set(name, Date.now() + DISABLE_FOR_MS);
+      rateLimitStreak.set(name, 0);
+      console.warn(`AI: ${name} отключён на ${DISABLE_FOR_MS / 60000} мин (повторные 429)`);
+    }
+    return;
+  }
+  rateLimitStreak.set(name, 0);
+}
+
+function isActive(name) {
+  const until = disabledUntil.get(name);
+  if (!until) return true;
+  if (Date.now() >= until) {
+    disabledUntil.delete(name);
+    return true;
+  }
+  return false;
 }
 
 export function providerPlan() {
+  const c = cfg();
   const plan = [];
-  if (GEMINI_API_KEY && !providerDisabledForRun.has('gemini')) plan.push({ name: 'gemini', enabled: true });
-  if (AI_FALLBACK_ENABLED && GROQ_API_KEY && !providerDisabledForRun.has('groq')) plan.push({ name: 'groq', enabled: true });
-  if (AI_FALLBACK_ENABLED && OPENROUTER_API_KEY && !providerDisabledForRun.has('openrouter')) plan.push({ name: 'openrouter', enabled: true });
-  if (AI_FALLBACK_ENABLED && MISTRAL_API_KEY && !providerDisabledForRun.has('mistral')) plan.push({ name: 'mistral', enabled: true });
-  if (AI_FALLBACK_ENABLED && SAMBANOVA_API_KEY && !providerDisabledForRun.has('sambanova')) plan.push({ name: 'sambanova', enabled: true });
-  if (AI_FALLBACK_ENABLED && CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN && !providerDisabledForRun.has('cloudflare')) plan.push({ name: 'cloudflare', enabled: true });
+  if (c.anthropicKey && isActive('anthropic')) plan.push({ name: 'anthropic', enabled: true });
+  if (c.fallbackEnabled && c.mistralKey && isActive('mistral')) plan.push({ name: 'mistral', enabled: true });
   return plan;
 }
 
-// Нужно снаружи (run.js), чтобы решить, нужна ли ещё длинная пауза
-// между объявлениями — она существует только ради лимита Gemini
-// (см. LLM_EXTRACT_DELAY_MS), и как только Gemini отключён circuit
-// breaker'ом на этот прогон, держать её длинной уже незачем.
+// Оставлено для совместимости с run.js (раньше решало, нужна ли длинная
+// пауза между объявлениями из-за лимитов Gemini).
 export function isProviderActiveThisRun(name) {
-  return !providerDisabledForRun.has(name);
+  return isActive(name);
 }
 
 export async function runAiJsonChain({
@@ -207,104 +251,31 @@ export async function runAiJsonChain({
     return { ok: false, reason: 'unavailable', provider: null };
   }
 
+  const c = cfg();
+  const hasFallback = Boolean(c.fallbackEnabled && c.mistralKey);
   let lastError = null;
+
   for (const provider of plan) {
     try {
-      let data;
-      if (provider.name === 'gemini') {
-        data = await callGemini({ model: GEMINI_MODEL, systemPrompt, userText, timeoutMs, maxTokens });
-      } else if (provider.name === 'groq') {
-        data = await callOpenAICompatible({
-          baseUrl: 'https://api.groq.com/openai/v1',
-          apiKey: GROQ_API_KEY,
-          model: GROQ_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-          // openai/gpt-oss-* — reasoning-модели: без этого параметра
-          // они по умолчанию тратят "medium" количество токенов на
-          // размышления ДО финального ответа, и при небольшом
-          // max_tokens (300 для извлечения полей) итоговый content
-          // приходит пустым — именно это давало "empty response".
-          extraBody: /gpt-oss/.test(GROQ_MODEL) ? { reasoning_effort: 'low' } : {},
-        });
-      } else if (provider.name === 'openrouter') {
-        data = await callOpenAICompatible({
-          baseUrl: 'https://openrouter.ai/api/v1',
-          apiKey: OPENROUTER_API_KEY,
-          model: OPENROUTER_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-          extraHeaders: {
-            ...(process.env.OPENROUTER_HTTP_REFERER ? { 'HTTP-Referer': process.env.OPENROUTER_HTTP_REFERER } : {}),
-            ...(process.env.OPENROUTER_APP_TITLE ? { 'X-Title': process.env.OPENROUTER_APP_TITLE } : {}),
-          },
-          // openrouter/free сам выбирает бесплатную модель, и часто
-          // это тоже reasoning-модель (DeepSeek/GLM/Qwen-thinking и
-          // т.п.) — тот же "empty response", что и с gpt-oss на Groq.
-          // effort:'low' + exclude:true просит минимум размышлений и
-          // не возвращать их в ответе, оставляя токены под сам JSON.
-          extraBody: { reasoning: { effort: 'low', exclude: true } },
-        });
-      } else if (provider.name === 'mistral') {
-        data = await callOpenAICompatible({
-          baseUrl: 'https://api.mistral.ai/v1',
-          apiKey: MISTRAL_API_KEY,
-          model: MISTRAL_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-        });
-      } else if (provider.name === 'sambanova') {
-        data = await callOpenAICompatible({
-          baseUrl: 'https://api.sambanova.ai/v1',
-          apiKey: SAMBANOVA_API_KEY,
-          model: SAMBANOVA_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-        });
-      } else if (provider.name === 'cloudflare') {
-        data = await callOpenAICompatible({
-          baseUrl: `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
-          apiKey: CLOUDFLARE_API_TOKEN,
-          model: CLOUDFLARE_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-        });
-      } else {
-        continue;
-      }
-      // Раньше успех вообще ничего не логировал — в логах было видно
-      // только падения, из-за чего казалось, что groq/openrouter/
-      // mistral не пробуются вообще, хотя на деле они
-      // отвечали с первого раза и просто молчали. Теперь видно, кто
-      // именно ответил на каждое объявление.
-      console.log(`${taskName}: provider ${provider.name} ok`);
-      return { ok: true, provider: provider.name, data };
+      const call = provider.name === 'anthropic' ? callAnthropic : callMistral;
+      const { data, usage } = await call({ systemPrompt, userText, timeoutMs, maxTokens });
+      rateLimitStreak.set(provider.name, 0);
+      console.log(
+        `${taskName}: provider ${provider.name} ok` +
+          (usage?.input != null ? ` (in ${usage.input} / out ${usage.output} tok)` : '')
+      );
+      return { ok: true, provider: provider.name, data, usage };
     } catch (err) {
       lastError = err;
-      console.warn(`${taskName}: provider ${provider.name} failed (${err.response?.status || err.message})`);
-      noteProviderResult(provider.name, err);
-      if (providerDisabledForRun.has(provider.name)) {
-        console.warn(`${taskName}: provider ${provider.name} отключён до конца прогона (повторный 429/402)`);
-      }
-      if (!AI_FALLBACK_ENABLED && provider.name === 'gemini') break;
-      if (!isRetryableError(err) && provider.name === 'gemini' && !AI_FALLBACK_ENABLED) break;
-      await sleep(PROVIDER_DELAY_MS);
+      console.warn(`${taskName}: provider ${provider.name} failed (${err?.response?.status || err.message})`);
+      noteFailure(provider.name, err);
+      await sleep(150);
     }
   }
 
   return {
     ok: false,
-    reason: AI_FALLBACK_ENABLED ? 'fallback_exhausted' : 'bad_response',
+    reason: hasFallback ? 'fallback_exhausted' : 'bad_response',
     provider: null,
     error: lastError?.message || 'all providers failed',
   };

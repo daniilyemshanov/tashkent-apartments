@@ -34,26 +34,13 @@ export default async function handler(req, res) {
 
   let query = supabase.from('listings').select('*', { count: 'exact' });
 
-  const sort = req.query.sort; // 'new' (по умолчанию) | 'price_asc' | 'price_desc' | 'deal_pct'
+  const sort = req.query.sort; // 'new' (по умолчанию) | 'price_asc' | 'price_desc'
   if (sort === 'price_asc') {
     query = query.order('price_value', { ascending: true, nullsFirst: false });
   } else if (sort === 'price_desc') {
     query = query.order('price_value', { ascending: false, nullsFirst: false });
-  } else if (sort === 'deal_pct') {
-    // Самые выгодные — по новому Deal Score, а при равенстве уже по старому
-    // отклонению от рынка. Так вверху остаются не просто "дешёвые",
-    // а действительно сильные сделки.
-    query = query.order('deal_score', { ascending: false, nullsFirst: false }).order('below_market_pct', { ascending: false, nullsFirst: false });
   } else {
     query = query.order('created_at', { ascending: false });
-  }
-
-  // Раздел "🔥 Выгодные" на сайте — только объявления, которые прошли
-  // новый Deal Score. Остальные фильтры (район, тип, цена и т.п.)
-  // продолжают применяться поверх этого же запроса — это не отдельная
-  // страница с своим API, а сужение того же запроса.
-  if (req.query.deals === 'true') {
-    query = query.eq('deal_candidate', true);
   }
 
   if (days !== null) {
@@ -158,7 +145,7 @@ export default async function handler(req, res) {
 
   const total = count ?? data.length;
   res.status(200).json({
-    items: sort === 'price_asc' || sort === 'price_desc' || sort === 'deal_pct' ? data : sortByPriority(data),
+    items: sort === 'price_asc' || sort === 'price_desc' ? data : sortByPriority(data),
     total,
     hasMore: from + data.length < total,
   });

@@ -2,10 +2,8 @@ import 'dotenv/config';
 import { createClient } from '@supabase/supabase-js';
 import WebSocket from 'ws';
 import { detectMarketSegment } from '../marketSegment.js';
-import { refreshMarketStatsIfStale } from '../marketStats.js';
 
-// Разовый скрипт: market_segment (см. ../marketSegment.js,
-// ../marketStats.js) появился в проекте 15.08.2026 и заполняется
+// Разовый скрипт: market_segment (см. ../marketSegment.js) появился в проекте 15.08.2026 и заполняется
 // заново только для объявлений, которые скрапер видит С ЭТОГО МОМЕНТА
 // (см. run.js). У всех объявлений, накопленных ДО этого, поле
 // market_segment = null — из-за этого сегментированная группировка
@@ -98,14 +96,6 @@ async function main() {
   console.log(
     `\nГотово. Проставлен сегмент: ${updated}. Явной фразы не нашлось: ${noPhraseFound}. Ошибок: ${errors}.`
   );
-
-  if (updated > 0) {
-    console.log('\nПересчитываю рыночную статистику — новые сегментированные группы должны появиться сразу...');
-    await refreshMarketStatsIfStale();
-    console.log('Статистика пересчитана.');
-  } else {
-    console.log('\nНи одного сегмента не проставлено — пересчёт статистики не требуется.');
-  }
 }
 
 main().catch((err) => {

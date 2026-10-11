@@ -264,28 +264,6 @@ const Card = memo(function Card({ listing, selected, myEmail, onToggleContacted,
         </div>
         <span className={`badge ${badge.cls}`}>{badge.text}</span>
       </div>
-      {(listing.below_market || listing.urgency_signal) && (
-        <p className="card-deal-line">
-          {listing.below_market && (
-            <span className="deal-badge">
-              🔥 На {listing.below_market_pct}% ниже рынка
-              {listing.market_segment === 'secondary' && ' (вторичка)'}
-              {listing.market_segment === 'new_build' && ' (новостройка)'}
-            </span>
-          )}
-          {listing.urgency_signal && (
-            <span className="deal-badge deal-badge-urgency">⚡ {listing.urgency_phrase}</span>
-          )}
-        </p>
-      )}
-      {(listing.deal_candidate || Number(listing.deal_score) >= 70) && (
-        <p className="card-deal-line">
-          <span className="deal-badge deal-badge-score">
-            💎 Deal Score {Math.round(Number(listing.deal_score) || 0)}/100
-            {listing.owner_score != null ? ` · Owner ${Math.round(Number(listing.owner_score))}` : ''}
-          </span>
-        </p>
-      )}
       <div className="card-bottom">
         <span className="price">{listing.price || 'цена не указана'}</span>
         <div className="card-actions">
@@ -579,7 +557,7 @@ function Dashboard() {
   const [loadingInitial, setLoadingInitial] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [statusText, setStatusText] = useState('Загрузка…');
-  const [stats, setStats] = useState({ total: 0, today: 0, owners: 0, notContacted: 0, deals: 0 });
+  const [stats, setStats] = useState({ total: 0, today: 0, owners: 0, notContacted: 0 });
 
   const [searchInput, setSearchInput] = useState('');
   const [search, setSearch] = useState('');
@@ -601,13 +579,6 @@ function Dashboard() {
   const [priceMin, setPriceMin] = useState('');
   const [priceMax, setPriceMax] = useState('');
   const [assignedFilter, setAssignedFilter] = useState('all');
-  // Отдельный экран "🔥 Выгодные" — не новый route, а переключатель
-  // поверх обычной ленты (см. обсуждение в чате: страница со своим
-  // адресом не нужна, важно было именно отдельное представление).
-  // Влючает ?deals=true в API и меняет сортировку по умолчанию на
-  // "сильнее всего ниже рынка" — см. buildListingsUrl и listings.js.
-  const [dealsOnly, setDealsOnly] = useState(false);
-
   const [selectedIds, setSelectedIds] = useState(() => new Set());
   const [bulkWorking, setBulkWorking] = useState(false);
 
@@ -799,9 +770,8 @@ function Dashboard() {
     if (typeFilter === 'commercial' && areaMin) params.set('areaMin', areaMin);
     if (typeFilter === 'commercial' && areaMax) params.set('areaMax', areaMax);
     if (assignedFilter === 'none') params.set('assigned', 'none');
-    if (dealsOnly) params.set('deals', 'true');
     return `/api/listings?${params.toString()}`;
-  }, [daysRange, search, dealFilter, typeFilter, roomsFilter, badgeFilter, contactedFilter, districtFilter, sortBy, priceCurrency, priceMin, priceMax, areaMin, areaMax, assignedFilter, dealsOnly]);
+  }, [daysRange, search, dealFilter, typeFilter, roomsFilter, badgeFilter, contactedFilter, districtFilter, sortBy, priceCurrency, priceMin, priceMax, areaMin, areaMax, assignedFilter]);
 
   const fetchStats = useCallback(async () => {
     const res = await authFetch(`/api/stats?days=${daysRange}`);
@@ -1053,27 +1023,10 @@ function Dashboard() {
         <div className="header-top">
           <div>
             <div className="eyebrow">Ташкент · недвижимость</div>
-            <h1>{dealsOnly ? '🔥 Выгодные — ниже рынка' : 'Лента новых объявлений'}</h1>
-            <p className="subtitle">
-              {dealsOnly
-                ? 'Цена/м² заметно ниже медианы по району — кандидаты на быструю продажу'
-                : 'Аренда и продажа · OLX.uz + Uybor.uz'}
-            </p>
+            <h1>Лента новых объявлений</h1>
+            <p className="subtitle">Аренда и продажа · OLX.uz + Uybor.uz</p>
           </div>
           <div className="header-actions">
-            <button
-              className={`btn ${dealsOnly ? 'is-on btn-contact' : ''}`}
-              onClick={() => {
-                const next = !dealsOnly;
-                setDealsOnly(next);
-                // Удобная сортировка по умолчанию для каждого режима —
-                // пользователь может тут же переключить вручную (см. select sortBy).
-                setSortBy(next ? 'deal_pct' : 'new');
-              }}
-              title="Показать только объявления с ценой заметно ниже рыночной"
-            >
-              🔥 Выгодные
-            </button>
             <button className="btn" onClick={() => setShowTeam(true)}>Команда</button>
             <button className="btn" onClick={() => supabase.auth.signOut()}>Выйти</button>
           </div>
@@ -1094,15 +1047,6 @@ function Dashboard() {
           <div className="stat"><div className="num">{stats.today}</div><div className="label">Сегодня</div></div>
           <div className="stat stat-owner"><div className="num">{stats.owners}</div><div className="label">Собственники</div></div>
           <div className="stat"><div className="num">{stats.notContacted}</div><div className="label">Ещё не связались</div></div>
-          <div
-            className="stat stat-deal"
-            role="button"
-            tabIndex={0}
-            onClick={() => { setDealsOnly(true); setSortBy('deal_pct'); }}
-            title="Показать только объявления ниже рынка"
-          >
-            <div className="num">{stats.deals}</div><div className="label">🔥 Ниже рынка</div>
-          </div>
         </div>
 
         <div className="toolbar ai-search-bar">
@@ -1163,7 +1107,6 @@ function Dashboard() {
             <option value="new">Сначала новые</option>
             <option value="price_asc">Цена: дешёвые → дорогие</option>
             <option value="price_desc">Цена: дорогие → дешёвые</option>
-            <option value="deal_pct">Сильнее всего ниже рынка</option>
           </select>
           <select value={priceCurrency} onChange={(e) => setPriceCurrency(e.target.value)}>
             <option value="all">Любая валюта</option>

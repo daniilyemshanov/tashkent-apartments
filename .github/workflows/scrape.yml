@@ -103,33 +103,14 @@ jobs:
           TELEGRAM_GROUP_COMMERCIAL: ${{ secrets.TELEGRAM_GROUP_COMMERCIAL }}
           TELEGRAM_GROUP_COMMERCIAL_RENT: ${{ secrets.TELEGRAM_GROUP_COMMERCIAL_RENT }}
           TELEGRAM_GROUP_HOUSE: ${{ secrets.TELEGRAM_GROUP_HOUSE }}
-          TELEGRAM_GROUP_DEALS: ${{ secrets.TELEGRAM_GROUP_DEALS }}
           USE_AI_CLASSIFICATION: ${{ secrets.USE_AI_CLASSIFICATION }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Без этого флага providerPlan() в aiProviders.js добавляет в
-          # цепочку ТОЛЬКО gemini — остальные ключи ниже (groq/openrouter/
-          # mistral) просто игнорируются, даже если они заведены в
-          # секретах. Именно поэтому таймаут gemini сразу давал
-          # "chain exhausted" вместо отката на следующего провайдера.
-          AI_FALLBACK_ENABLED: "true"
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          # 19.08.2026: Cerebras убран из цепочки целиком (не только из
-          # кода, но и отсюда) — бесплатный тариф стал разовым
-          # $5-кредитом, на аккаунте проекта исчерпан, стабильные 402.
-          # Пятое звено вместо него — Mistral (см. ниже).
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          # 19.08.2026: шестое и седьмое звено цепочки — SambaNova Cloud
-          # и Cloudflare Workers AI, оба независимы от остальных
-          # провайдеров по инфраструктуре (свои чипы / edge-сеть). Без
-          # этих трёх секретов в репозитории (Settings → Secrets and
-          # variables → Actions) они просто не попадут в цепочку — как
-          # и раньше с MISTRAL_API_KEY, providerPlan() тихо их
-          # пропустит, если переменная пустая.
-          SAMBANOVA_API_KEY: ${{ secrets.SAMBANOVA_API_KEY }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # ИИ в скрапере выключен (USE_AI_EXTRACTION не задан = false): разбор
+          # объявлений идёт regex-парсером, ИИ работает только в поиске (Vercel).
+          # Чтобы включить ИИ-разбор обратно, добавьте сюда:
+          #   USE_AI_EXTRACTION: "true"
+          #   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          #   AI_FALLBACK_ENABLED: "true"
+          #   MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
           # Опционально: http://user:pass@host:port резидентного/мобильного
           # прокси для запросов к OLX (см. src/http.js). Если секрет не

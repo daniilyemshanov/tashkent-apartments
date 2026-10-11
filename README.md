@@ -137,9 +137,7 @@ Such listings receive a **Below Market** indicator and can additionally be sent 
 The system also tracks:
 
 - Price history
-- Deal score
 - Owner score
-- Market deviation
 
 ---
 
@@ -196,7 +194,6 @@ Apartments for Rent
 Commercial
 Commercial for Rent
 Houses
-Deals
 ```
 
 The system can also send administrative alerts to a separate private chat.
@@ -272,8 +269,7 @@ scraper/
 │   ├── scrapers/
 │   ├── classify.js
 │   ├── extractListingInfo.js
-│   ├── marketStats.js
-│   ├── dealScoring.js
+│   ├── listingScoring.js
 │   ├── run.js
 │   └── setup-topics.js
 └── .env.example
@@ -384,7 +380,6 @@ TELEGRAM_GROUP_APARTMENT_RENT=
 TELEGRAM_GROUP_COMMERCIAL=
 TELEGRAM_GROUP_COMMERCIAL_RENT=
 TELEGRAM_GROUP_HOUSE=
-TELEGRAM_GROUP_DEALS=
 ```
 
 The bot should be added as an administrator in groups where it needs to publish listings or manage topics.
@@ -593,9 +588,8 @@ Current focus:
 - Определение вероятного собственника
 - AI-извлечение данных
 - AI-поиск
-- Рыночная аналитика
 - История изменения цены
-- Deal score и owner score
+- Owner score
 - Telegram-бот
 - Telegram-уведомления
 - Авторизация

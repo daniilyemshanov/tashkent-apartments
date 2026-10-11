@@ -1,7 +1,7 @@
 // Общая логика ИИ-поиска — вызывается и с сайта (api/ai-search.js), и
 // из Telegram-бота (api/telegram-webhook.js, команда /search).
-// Использует единый AIProvider-chain: Gemini → Groq → Cerebras →
-// OpenRouter, если включён AI_FALLBACK_ENABLED.
+// Использует цепочку из _aiProviders.js: Claude Haiku 5.5 (основной) →
+// Mistral (запасной, если включён AI_FALLBACK_ENABLED).
 //
 // НЕ ищет объявления сам — только переводит свободный текст в
 // структурированные фильтры. Кто вызывает — сам решает, как
@@ -11,10 +11,9 @@
 import { DISTRICTS } from '../src/districts.js';
 import { runAiJsonChain } from './_aiProviders.js';
 
-// LLM_TIMEOUT_MS синхронизирован с DEFAULT_TIMEOUT_MS в _aiProviders.js
-// (8с) — иначе один медленный провайдер снова мог бы съесть весь
-// 60-секундный бюджет функции (см. client/vercel.json и подробное
-// объяснение в _aiProviders.js).
+// Таймаут на ОДИН вызов провайдера. Худший случай для цепочки из двух
+// звеньев: Claude (8с) + 1 повтор при 429/5xx (8с) + Mistral (8с) ≈ 25с —
+// с запасом укладывается в 60с (client/vercel.json, maxDuration).
 const LLM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS) || 8000;
 
 // Список районов передаём в промпт как закрытый enum — модель обязана

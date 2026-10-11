@@ -32,7 +32,7 @@ export async function getListingById(id) {
   const { data, error } = await supabase
     .from('listings')
     .select(
-      'id, url, title, price, price_value, price_currency, price_per_sqm, raw_text, district, rooms, area, phone, phone_normalized, seller_name, seller_type, confidence, label_kind, label_text, seller_listings_count, market_segment, below_market, below_market_pct, market_sample_size, urgency_signal, urgency_phrase, deal_score, owner_score, deal_candidate, is_duplicate, duplicate_of_id, duplicate_reason, entity_key, price_history, price_history_count, price_drop_count, price_change_count, last_price_change_pct, last_price_change_at, first_seen_price_value, last_seen_price_value, notified, created_at'
+      'id, url, title, price, price_value, price_currency, price_per_sqm, raw_text, district, rooms, area, phone, phone_normalized, seller_name, seller_type, confidence, label_kind, label_text, seller_listings_count, market_segment, owner_score, is_duplicate, duplicate_of_id, duplicate_reason, entity_key, price_history, price_history_count, price_drop_count, price_change_count, last_price_change_pct, last_price_change_at, first_seen_price_value, last_seen_price_value, notified, created_at'
     )
     .eq('id', id)
     .maybeSingle();
@@ -53,7 +53,7 @@ export async function getLatestListingByEntityKey(entityKey, excludeId = null) {
   let query = supabase
     .from('listings')
     .select(
-      'id, url, title, price, price_value, price_currency, price_per_sqm, phone_normalized, district, rooms, area, entity_key, price_history, price_history_count, price_drop_count, price_change_count, last_price_change_pct, last_price_change_at, first_seen_price_value, last_seen_price_value, deal_score, owner_score, below_market_pct, market_sample_size, urgency_signal, urgency_phrase, notified, created_at'
+      'id, url, title, price, price_value, price_currency, price_per_sqm, phone_normalized, district, rooms, area, entity_key, price_history, price_history_count, price_drop_count, price_change_count, last_price_change_pct, last_price_change_at, first_seen_price_value, last_seen_price_value, owner_score, notified, created_at'
     )
     .eq('entity_key', entityKey)
     .order('created_at', { ascending: false })
@@ -207,82 +207,3 @@ export async function saveTopicId(groupKey, district, messageThreadId) {
   }
 }
 
-// ---------- Рыночная статистика цены за м² (см. marketStats.js) ----------
-
-/**
- * Объявления за последние N дней с уже посчитанной ценой за м²,
- * исключая агентства (иначе накрутка агентствами через несколько
- * объявлений на один и тот же объект искажает медиану). Собственный
- * список полей — только то, что реально нужно для группировки, чтобы
- * не тащить лишнее (raw_text и т.п.) на потенциально тысячах строк.
- */
-export async function getStatsSourceListings(days) {
-  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  const { data, error } = await supabase
-    .from('listings')
-    .select('price_per_sqm, district, property_type, deal_type, price_currency, market_segment')
-    .gte('created_at', cutoff)
-    .not('price_per_sqm', 'is', null)
-    .neq('is_duplicate', true)
-    .in('label_kind', ['owner', 'unchecked']);
-  if (error) {
-    console.error('Supabase (getStatsSourceListings) ошибка:', error.message);
-    return [];
-  }
-  return data || [];
-}
-
-/**
- * Перезаписывает медианы по группам (upsert по group_key — старое
- * значение группы просто заменяется свежим, ничего не копится).
- */
-export async function upsertMarketStats(rows) {
-  const payload = rows.map((r) => ({ ...r, updated_at: new Date().toISOString() }));
-  const { error } = await supabase.from('market_stats').upsert(payload, { onConflict: 'group_key' });
-  if (error) {
-    console.error('Supabase (upsertMarketStats) ошибка:', error.message);
-  }
-}
-
-/**
- * @returns {Promise<string|null>} updated_at самой свежей группы, или
- *   null, если таблица ещё пустая (тогда пересчёт точно нужен).
- */
-export async function getMarketStatsFreshness() {
-  const { data, error } = await supabase
-    .from('market_stats')
-    .select('updated_at')
-    .order('updated_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  if (error) {
-    console.error('Supabase (getMarketStatsFreshness) ошибка:', error.message);
-    return null;
-  }
-  return data?.updated_at ?? null;
-}
-
-export async function getAllMarketStats() {
-  const { data, error } = await supabase.from('market_stats').select('group_key, median_price_per_sqm, sample_size');
-  if (error) {
-    console.error('Supabase (getAllMarketStats) ошибка:', error.message);
-    return [];
-  }
-  return data || [];
-}
-
-// Ручной "затравочный" ориентир (см. supabase/15_market_stats_manual.sql)
-// — читается редко (раз за прогон, как и getAllMarketStats), используется
-// только когда по группе не хватает реальных объявлений (см. evaluateDeal
-// в marketStats.js). Таблицы может не быть, если миграция ещё не
-// накатана — тогда просто возвращаем пустой список, а не роняем прогон.
-export async function getAllMarketStatsManual() {
-  const { data, error } = await supabase
-    .from('market_stats_manual')
-    .select('group_key, median_price_per_sqm');
-  if (error) {
-    console.warn('Supabase (getAllMarketStatsManual) — таблицы нет или ошибка, пропускаю:', error.message);
-    return [];
-  }
-  return data || [];
-}

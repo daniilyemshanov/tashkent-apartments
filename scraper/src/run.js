@@ -10,7 +10,7 @@ import { fetchDomtutListings, fetchDomtutDetails } from './scrapers/domtut.js';
 // TODO там же.
 import { fetchJoymeeListings, fetchJoymeeDetails } from './scrapers/joymee.js';
 import { classifyListing, labelFor, SELLER_LISTINGS_AGENT_THRESHOLD } from './classify.js';
-import { notifyAlert, notifyToTopicGroup, notifyDeal } from './telegram.js';
+import { notifyAlert, notifyToTopicGroup } from './telegram.js';
 import {
   getListingById,
   getLatestListingByEntityKey,
@@ -24,23 +24,17 @@ import { cleanAgentBacklog } from './cleanAgentMessages.js';
 import { findAgentTextSignal } from './agentSignals.js';
 import { normalizePhone } from './phone.js';
 import { extractListingInfo, extractListingInfoRegexOnly } from './extractListingInfo.js';
-import { isProviderActiveThisRun } from './aiProviders.js';
-import { findUrgencySignal } from './urgencySignals.js';
-import { refreshMarketStatsIfStale, loadMarketStatsMap, evaluateDeal } from './marketStats.js';
 import { detectMarketSegment } from './marketSegment.js';
 import {
   makeEntityKey,
   summarizePriceHistory,
   computeOwnerScore,
-  computeDealScore,
-  shouldNotifyDealCandidate,
   isSignificantPriceChange,
   isDuplicatePriceChange,
-} from './dealScoring.js';
+} from './listingScoring.js';
 
-// Тот же курс, что и в marketStats.js (см. пояснение там) — нужен тут
-// для санити-проверки price_per_sqm ниже, ДО того как значение вообще
-// попадёт в базу.
+// Курс USD/UZS — нужен для санити-проверки price_per_sqm ниже, ДО того
+// как значение вообще попадёт в базу, и для сравнения цен в USD.
 const EXCHANGE_RATE_USD_UZS = Number(process.env.EXCHANGE_RATE_USD_UZS) || 12700;
 
 // Сколько ДРУГИХ объявлений с тем же номером телефона считаем
@@ -52,36 +46,25 @@ const EXCHANGE_RATE_USD_UZS = Number(process.env.EXCHANGE_RATE_USD_UZS) || 12700
 // повторную публикацию одного и того же объекта.
 const PHONE_REUSE_AGENT_THRESHOLD = 2;
 
-// Между вызовами extractListingInfo (LLM) — пауза, чтобы не упереться
-// в лимит бесплатного тира Gemini (10 запросов/мин). БЫЛО 7000мс
-// (~8.5 запросов/мин с запасом) — но это означало, что при большом
-// числе НОВЫХ объявлений за один прогон (после паузы, наплыва и т.п.)
-// скрапер не успевал пройти все source×propertyType×dealType
-// комбинации за timeout-minutes из scrape.yml: пауза применяется на
-// каждое новое объявление, пока circuit breaker явно не отключит
-// Gemini на этот прогон (после 3 подряд 429/402), а не только когда
-// Gemini реально отвечает — то есть почти всегда, даже если конкретный
-// вызов в итоге обслужил Groq/Mistral/... .
-// 13.09.2026: снижено до 2000мс (~30 запросов/мин) — это ЧАЩЕ лимита
-// Gemini, но это осознанно: как только квота исчерпана, 429 приходят
-// быстро (не таймаутом) и почти гарантированно ПОДРЯД, так что breaker
-// в aiProviders.js отключает Gemini на весь остаток прогона за 3
-// быстрых неудачных попытки — и дальше вся очередь новых объявлений
-// идёт через быстрые провайдеры без всякой паузы вообще (см. ветку
-// LLM_EXTRACT_DELAY_MS_NO_GEMINI ниже). Цена — горстка потраченных
-// впустую (но быстрых) 429-запросов к Gemini один раз за прогон,
-// вместо многих минут искусственного ожидания на каждом объявлении.
-// Если понадобится точнее настроить — можно переопределить через
-// секрет LLM_EXTRACT_DELAY_MS в GitHub Actions (env уже прокинут).
-const LLM_EXTRACT_DELAY_MS = Number(process.env.LLM_EXTRACT_DELAY_MS) || 2000;
-// Как только Gemini отключается circuit breaker'ом на этот прогон
-// (см. aiProviders.js) — длинная пауза больше не нужна, она была
-// нужна только ради его лимита. Groq/OpenRouter не настолько строгие,
-// короткой паузы достаточно, чтобы не долбить их слишком часто.
-const LLM_EXTRACT_DELAY_MS_NO_GEMINI = Number(process.env.LLM_EXTRACT_DELAY_MS_NO_GEMINI) || 1500;
+// Между вызовами extractListingInfo (LLM) — небольшая пауза, чтобы не
+// упереться в rate limit аккаунта Anthropic (новые аккаунты стартуют с
+// невысоких лимитов запросов в минуту). Раньше здесь было 2000мс из-за
+// 10 запросов/мин у бесплатного Gemini; с платным Claude Haiku 5.5 длинная
+// пауза не нужна. Запрос и так занимает 1–3 с, так что реальная скорость —
+// порядка 15–25 запросов/мин. При 429 aiProviders.js сам делает повтор и
+// уходит на запасного провайдера. Переопределяется ENV LLM_EXTRACT_DELAY_MS.
+const LLM_EXTRACT_DELAY_MS = Number(process.env.LLM_EXTRACT_DELAY_MS) || 500;
+
+// ИИ в скрапере ВЫКЛЮЧЕН по умолчанию: разбор площади/комнат/этажа делает
+// бесплатный regex-парсер (extractListingInfoRegexOnly). Оценки «выгодности»
+// объявлений в проекте больше нет. ИИ используется ТОЛЬКО для
+// поиска: ИИ-поиск на сайте, команда /search и др. команды бота (client/api).
+// Чтобы вернуть ИИ-разбор объявлений в скрапере (платные вызовы на каждое
+// новое объявление), задайте USE_AI_EXTRACTION=true и добавьте
+// ANTHROPIC_API_KEY в окружение скрапера (см. scrape.yml).
+const USE_AI_EXTRACTION = process.env.USE_AI_EXTRACTION === 'true';
 
 const PHONE_REGEX = /(\+?998[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})/;
-const DEAL_SCORE_MIN_MARKET_COMPONENT = Number(process.env.DEAL_SCORE_MIN_MARKET_COMPONENT) || 10;
 const REALTING_ENABLED = process.env.REALTING_ENABLED !== 'false';
 const DOMTUT_ENABLED = process.env.DOMTUT_ENABLED !== 'false';
 
@@ -145,7 +128,7 @@ async function olxDelay() {
 // `process.env.USE_AI_CLASSIFICATION === 'true'`.
 const USE_AI_CLASSIFICATION = false;
 
-async function processSource(fetchList, fetchDetails, sourceName, dealType, fetchSellerCount = null, propertyType = 'apartment', marketStatsMap = null) {
+async function processSource(fetchList, fetchDetails, sourceName, dealType, fetchSellerCount = null, propertyType = 'apartment') {
   const sourceLabel = `${sourceName}-${propertyType}-${dealType}`;
   console.log(`[${sourceLabel}] проверяю новые объявления...`);
 
@@ -196,7 +179,7 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
     const existingById = await getListingById(item.id);
     const listPrice = parsePrice(item.price);
     const hasBackfilledScoring =
-      existingById?.deal_score != null && existingById?.owner_score != null && existingById?.price_history_count != null;
+      existingById?.owner_score != null && existingById?.price_history_count != null;
     const sameKnownPrice =
       existingById &&
       existingById.price_value != null &&
@@ -550,11 +533,12 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
     // площадь/комнаты он всё равно даёт (нужны для entityKey и
     // price_per_sqm, чтобы не плодить дублей в базе при повторных
     // прогонах).
-    const llmInfo = isConfirmedAgent
-      ? extractListingInfoRegexOnly(rawText)
-      : await extractListingInfo(rawText);
-    if (!isConfirmedAgent) {
-      await sleep(isProviderActiveThisRun('gemini') ? LLM_EXTRACT_DELAY_MS : LLM_EXTRACT_DELAY_MS_NO_GEMINI);
+    const useAiForThis = USE_AI_EXTRACTION && !isConfirmedAgent;
+    const llmInfo = useAiForThis
+      ? await extractListingInfo(rawText)
+      : extractListingInfoRegexOnly(rawText);
+    if (useAiForThis) {
+      await sleep(LLM_EXTRACT_DELAY_MS);
     }
 
     // Для коммерции ("офис", "склад", "магазин" и т.п.) понятие
@@ -574,8 +558,7 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
     // строке 184) его не поймали.
     if (!marketSegment) marketSegment = llmInfo.market_segment;
 
-    // Цена за м² — только когда есть и цена, и площадь; используется
-    // детектором "ниже рынка" (см. marketStats.js).
+    // Цена за м² — только когда есть и цена, и площадь.
     //
     // Санити-проверка ДОБАВЛЕНА 12.08.2026, ПОСЛЕ реального случая:
     // JSON-LD цена с OLX иногда даёт мусорное число ("5 у.е." на
@@ -583,12 +566,10 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
     // выше), а Uzbek-латиница в тексте объявления может обмануть
     // regex площади (см. listingDetails.js) и подсунуть не то число.
     // Оба случая дают price_per_sqm, отличающуюся от реальной в СОТНИ
-    // или ТЫСЯЧИ раз — а такую ошибку статистика (marketStats.js)
-    // сама по себе распознать не может, она просто видит "очень
-    // низкую цену" и радостно ставит below_market=true. Поэтому —
-    // грубый, заведомо widе "не бывает такого" фильтр в USD-эквиваленте
+    // или ТЫСЯЧИ раз — и такое значение просто мусор. Поэтому —
+    // грубый, заведомо широкий "не бывает такого" фильтр в USD-эквиваленте
     // (независимо от валюты объявления), ДО того, как значение вообще
-    // попадёт в базу/статистику. Границы намеренно нестрогие — это не
+    // попадёт в базу. Границы намеренно нестрогие — это не
     // попытка отсечь реальные дешёвые/дорогие варианты, а только явный
     // мусор на порядки off.
     const PRICE_PER_SQM_SANITY_USD = {
@@ -609,22 +590,6 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       rawPricePerSqm && isPlausiblePricePerSqm(rawPricePerSqm, priceCurrency, dealType)
         ? rawPricePerSqm
         : null;
-
-    // Срочность/торг из текста — не зависит от цены, отдельный сигнал
-    // (см. urgencySignals.js). Полезен даже без below_market: часто
-    // просто подсказывает, что с продавцом можно поторговаться.
-    const urgencyPhrase = findUrgencySignal(rawText);
-
-    const { belowMarket, belowMarketPct, sampleSize } = marketStatsMap
-      ? evaluateDeal(marketStatsMap, {
-          propertyType,
-          dealType,
-          district,
-          currency: priceCurrency,
-          pricePerSqm,
-          marketSegment,
-        })
-      : { belowMarket: false, belowMarketPct: null, sampleSize: null };
 
     const sellerNameLooksLikePerson = looksLikePersonName(sellerName);
     const ownerScoreResult = computeOwnerScore({
@@ -679,14 +644,6 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       EXCHANGE_RATE_USD_UZS
     );
 
-    const dealScoreResult = computeDealScore({
-      belowMarketPct,
-      marketSampleSize: sampleSize,
-      ownerScore: ownerScoreResult.score,
-      priceHistory: priceHistorySummary,
-      urgencyPhrase,
-    });
-
     const entityCacheKey = `${entityKey}:${item.id}`;
     const latestEntityListing =
       previousForSameId || entityLookupCache.get(entityCacheKey) || (await getLatestListingByEntityKey(entityKey, item.id));
@@ -706,13 +663,6 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       sameEntityExists &&
       !sameIdPriceChanged &&
       (isDuplicatePriceChange(latestEntityUsd, currentPriceUsd) || currentPriceUsd == null || latestEntityUsd == null);
-    const shouldSendDeal = !isConfirmedAgent && !duplicateByEntity && shouldNotifyDealCandidate(dealScoreResult.score);
-    const dealCandidate =
-      shouldSendDeal &&
-      (dealScoreResult.components.market >= DEAL_SCORE_MIN_MARKET_COMPONENT ||
-        priceHistorySummary.dropCount >= 1 ||
-        ownerScoreResult.score >= 80);
-
     const duplicateReason = duplicateByEntity
       ? latestEntityUsd && currentPriceUsd
         ? `тот же объект уже был в базе, цена изменилась менее чем на ${Number(process.env.DUPLICATE_PRICE_CHANGE_THRESHOLD_PCT) || 5}%`
@@ -729,20 +679,12 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       price_value: priceValue,
       price_currency: priceCurrency,
       price_per_sqm: pricePerSqm,
-      below_market: belowMarket,
-      below_market_pct: belowMarketPct,
-      market_sample_size: sampleSize,
       market_segment: marketSegment,
-      urgency_signal: !!urgencyPhrase,
-      urgency_phrase: urgencyPhrase,
       entity_key: entityKey,
       is_duplicate: duplicateByEntity,
       duplicate_of_id: duplicateByEntity ? latestEntityListing.id : null,
       duplicate_reason: duplicateReason,
-      deal_candidate: dealCandidate,
-      deal_score: dealScoreResult.score,
       owner_score: ownerScoreResult.score,
-      deal_score_breakdown: dealScoreResult.components,
       owner_score_breakdown: ownerScoreResult,
       price_history: priceHistorySummary.history,
       price_history_count: priceHistorySummary.count,
@@ -835,20 +777,6 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       console.error('Ошибка отправки в Telegram:', err.message);
     }
 
-    // Отдельно, ДОПОЛНИТЕЛЬНО к обычной теме района — если объявление
-    // "ниже рынка", дублируем его в отдельную супергруппу "Выгодные"
-    // (тема по району внутри неё же). Специально не заменяем обычную
-    // отправку выше: пользователь по-прежнему видит все объявления
-    // своего района в привычном месте, а "Выгодные" — это фильтр
-    // поверх, а не альтернативный канал.
-    if (listing.deal_candidate) {
-      try {
-        await notifyDeal(listing);
-      } catch (err) {
-        console.error('Ошибка отправки в Telegram (тема "Выгодные"):', err.message);
-      }
-    }
-
     await new Promise((r) => setTimeout(r, 1200));
   }
 
@@ -912,32 +840,23 @@ async function main() {
     console.log(`Прогон ограничен DEAL_TYPE_FILTER=${DEAL_TYPE_FILTER}`);
   }
 
-  // Пересчёт медиан цены за м² (если устарели/пусто) ДО обработки
-  // объявлений этого прогона — см. marketStats.js. Затем сама таблица
-  // грузится в память один раз (loadMarketStatsMap) и передаётся во
-  // все processSource(), а не читается из базы на каждое объявление.
-  // Безопасно дублировать в обоих параллельных job'ах (sale/rent) —
-  // это идемпотентный upsert по group_key, без обращений к LLM.
-  await refreshMarketStatsIfStale();
-  const marketStatsMap = await loadMarketStatsMap();
-
   // Продажа — в приоритете, проверяем её первой в каждом цикле
   if (RUN_SALE) {
     for (const propertyType of OLX_PROPERTY_TYPES) {
-      await processSource(fetchOlxListings, fetchOlxDetails, 'olx', 'sale', fetchOlxSellerListingsCount, propertyType, marketStatsMap);
+      await processSource(fetchOlxListings, fetchOlxDetails, 'olx', 'sale', fetchOlxSellerListingsCount, propertyType);
       await olxDelay();
     }
     for (const propertyType of UYBOR_PROPERTY_TYPES) {
-      await processSource(fetchUyborListings, fetchUyborDetails, 'uybor', 'sale', null, propertyType, marketStatsMap);
+      await processSource(fetchUyborListings, fetchUyborDetails, 'uybor', 'sale', null, propertyType);
     }
     if (REALTING_ENABLED) {
       for (const propertyType of REALTING_PROPERTY_TYPES) {
-        await processSource(fetchRealtingListings, fetchRealtingDetails, 'realting', 'sale', null, propertyType, marketStatsMap);
+        await processSource(fetchRealtingListings, fetchRealtingDetails, 'realting', 'sale', null, propertyType);
       }
     }
     if (DOMTUT_ENABLED) {
       for (const propertyType of DOMTUT_PROPERTY_TYPES) {
-        await processSource(fetchDomtutListings, fetchDomtutDetails, 'domtut', 'sale', null, propertyType, marketStatsMap);
+        await processSource(fetchDomtutListings, fetchDomtutDetails, 'domtut', 'sale', null, propertyType);
       }
     }
     // Joymee: endpoint/поля подтверждены вживую 11.08.2026 (см. шапку
@@ -947,26 +866,26 @@ async function main() {
     // fetchJoymeeDetails (advertiser_type !== 1 → sellerNameLooksLikeAgent
     // → агентства не уходят в Telegram, см. processSource выше).
     for (const propertyType of JOYMEE_PROPERTY_TYPES) {
-      await processSource(fetchJoymeeListings, fetchJoymeeDetails, 'joymee', 'sale', null, propertyType, marketStatsMap);
+      await processSource(fetchJoymeeListings, fetchJoymeeDetails, 'joymee', 'sale', null, propertyType);
     }
   }
 
   if (RUN_RENT) {
     for (const propertyType of OLX_PROPERTY_TYPES) {
-      await processSource(fetchOlxListings, fetchOlxDetails, 'olx', 'rent', fetchOlxSellerListingsCount, propertyType, marketStatsMap);
+      await processSource(fetchOlxListings, fetchOlxDetails, 'olx', 'rent', fetchOlxSellerListingsCount, propertyType);
       await olxDelay();
     }
     for (const propertyType of UYBOR_PROPERTY_TYPES) {
-      await processSource(fetchUyborListings, fetchUyborDetails, 'uybor', 'rent', null, propertyType, marketStatsMap);
+      await processSource(fetchUyborListings, fetchUyborDetails, 'uybor', 'rent', null, propertyType);
     }
     if (REALTING_ENABLED) {
       for (const propertyType of REALTING_PROPERTY_TYPES) {
-        await processSource(fetchRealtingListings, fetchRealtingDetails, 'realting', 'rent', null, propertyType, marketStatsMap);
+        await processSource(fetchRealtingListings, fetchRealtingDetails, 'realting', 'rent', null, propertyType);
       }
     }
     if (DOMTUT_ENABLED) {
       for (const propertyType of DOMTUT_PROPERTY_TYPES) {
-        await processSource(fetchDomtutListings, fetchDomtutDetails, 'domtut', 'rent', null, propertyType, marketStatsMap);
+        await processSource(fetchDomtutListings, fetchDomtutDetails, 'domtut', 'rent', null, propertyType);
       }
     }
     // Joymee-аренда: deal_type=2 подтверждён вживую 11.08.2026 (см.
@@ -974,7 +893,7 @@ async function main() {
     // аренды тоже все подтверждены (см. JOYMEE_CATEGORY.rent в
     // scrapers/joymee.js).
     for (const propertyType of JOYMEE_PROPERTY_TYPES) {
-      await processSource(fetchJoymeeListings, fetchJoymeeDetails, 'joymee', 'rent', null, propertyType, marketStatsMap);
+      await processSource(fetchJoymeeListings, fetchJoymeeDetails, 'joymee', 'rent', null, propertyType);
     }
   }
   console.log('Проверка завершена.');

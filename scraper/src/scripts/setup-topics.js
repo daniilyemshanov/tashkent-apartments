@@ -25,7 +25,6 @@ const GROUPS = {
   commercial: (process.env.TELEGRAM_GROUP_COMMERCIAL || '').trim(),
   commercial_rent: (process.env.TELEGRAM_GROUP_COMMERCIAL_RENT || '').trim(),
   house: (process.env.TELEGRAM_GROUP_HOUSE || '').trim(),
-  deals: (process.env.TELEGRAM_GROUP_DEALS || '').trim(), // "Выгодные" — см. marketStats.js/notifyDeal в telegram.js
 };
 
 const GROUP_LABELS = {
@@ -34,7 +33,6 @@ const GROUP_LABELS = {
   commercial: 'Коммерция (продажа)',
   commercial_rent: 'Коммерция (аренда)',
   house: 'Дома',
-  deals: 'Выгодные (ниже рынка)',
 };
 
 async function createTopic(chatId, name) {

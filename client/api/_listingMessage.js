@@ -18,44 +18,6 @@ function badgeText(listing) {
   return '❓ Сомнительно — проверьте сами';
 }
 
-function dealScoreBlock(listing) {
-  if (!listing?.deal_candidate && !(listing?.deal_score >= 70)) return '';
-
-  const tier =
-    listing.deal_score >= 90
-      ? '🔥 очень выгодное'
-      : listing.deal_score >= 80
-        ? '⚡ выгодное'
-        : listing.deal_score >= 70
-          ? '💡 потенциально выгодное'
-          : null;
-  const marketLine =
-    listing.below_market_pct != null
-      ? `Цена ниже рынка: ${Math.max(0, Number(listing.below_market_pct)).toFixed(1).replace(/\.0$/, '')}%\n`
-      : 'Цена ниже рынка: данных мало\n';
-  const ownerLine =
-    listing.owner_score != null ? `Owner Score: ${Math.round(Number(listing.owner_score))}/100\n` : '';
-  const historyLine =
-    listing.price_history_count > 1
-      ? `Цена снижалась: ${Math.max(0, Number(listing.price_drop_count) || 0)} раз\n`
-      : '';
-  const lastDropLine =
-    listing.last_price_change_pct != null
-      ? `Последнее изменение: ${Number(listing.last_price_change_pct).toFixed(1).replace(/\.0$/, '')}%\n`
-      : '';
-  const urgencyLine = listing.urgency_signal ? `Срочность: ${listing.urgency_phrase || 'есть сигнал'}\n` : '';
-
-  return (
-    `💎 Deal Score: ${Math.round(Number(listing.deal_score) || 0)}/100${tier ? ` · ${tier}` : ''}\n` +
-    marketLine +
-    ownerLine +
-    historyLine +
-    lastDropLine +
-    urgencyLine +
-    '\n'
-  );
-}
-
 export function buildListingText(listing) {
   const roomsLine = listing.rooms ? `${listing.rooms}-комн. ` : '';
   const areaLine = listing.area ? `, ${listing.area} м²` : '';
@@ -73,7 +35,6 @@ export function buildListingText(listing) {
   return (
     `🏠 Новое объявление (${listing.source})\n` +
     `${badgeText(listing)}\n\n` +
-    dealScoreBlock(listing) +
     dealLine +
     typeLine +
     `${roomsLine}${listing.title}${areaLine}\n` +

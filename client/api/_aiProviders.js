@@ -1,76 +1,69 @@
-// ВАЖНО: это отдельная копия цепочки ИИ-провайдеров от
-// scraper/src/aiProviders.js — используется тут, на Vercel
-// (client/api/_aiSearch.js: ИИ-поиск на сайте и команда /search в
-// Telegram-боте), потому что это другой деплоймент-юнит без общего
-// import-пути со scraper/. Если чините цепочку в одном месте —
-// проверьте и второе (см. также замечание в scraper/src/aiProviders.js).
+// ============================================================================
+// ИИ-слой проекта: ОДИН платный основной провайдер + ОДИН бесплатный запасной.
 //
-// 19.08.2026: синхронизировано с фиксами из scraper/src/aiProviders.js
-// (актуальные модели вместо задепрекейченных/платных, reasoning_effort
-// для reasoning-моделей) — до этого поиск тут тихо ходил по цепочке
-// Gemini -> Groq(404, дохлая модель) -> Cerebras(402) -> OpenRouter(402
-// на платной модели) и почти всегда падал сразу на Gemini без реального
-// фолбэка, хотя AI_FALLBACK_ENABLED был включён.
+//   1) Claude Haiku 5.5 (Anthropic)  — основной, платный, быстрый, стабильный
+//   2) Mistral (mistral-small-latest) — запасной, бесплатный (опционально)
 //
-// Cerebras убран из цепочки вообще (19.08.2026) — их бесплатный тариф
-// в 2026 стал разовым $5-кредитом вместо постоянного free tier, на
-// аккаунте проекта исчерпан, и без привязки карты не восстановится.
-// Раз он не работает и чинить нечем — просто выпилен, а не оставлен
-// как мёртвое звено, которое на каждый запрос сначала падает с 402 и
-// только потом идёт дальше по цепочке.
+// Раньше здесь была цепочка из шести бесплатных провайдеров (Gemini, Groq,
+// OpenRouter, Mistral, SambaNova, Cloudflare) — их ломали квоты, снятые с
+// обслуживания модели и 402. Теперь цепочка короткая и предсказуемая.
 //
-// 19.08.2026: добавлены SambaNova и Cloudflare Workers AI пятым и
-// шестым звеном (после Mistral) — при 4 провайдерах шанс, что упадут
-// все одновременно, был ощутимо больше 10%; независимые от остальных
-// провайдеров (свои чипы/edge-сеть) снижают этот риск.
+// ВАЖНО: файл существует в ДВУХ копиях, которые должны быть ИДЕНТИЧНЫ
+// (разные деплой-юниты, общего import-пути нет):
+//   scraper/src/aiProviders.js   — скрапер (GitHub Actions / VPS)
+//   client/api/_aiProviders.js   — Vercel (ИИ-поиск на сайте, /search в боте)
+// Проверка одной командой из корня репозитория:
+//   diff scraper/src/aiProviders.js client/api/_aiProviders.js
+//
+// Публичный интерфейс не изменился (runAiJsonChain, providerPlan,
+// isProviderActiveThisRun) — вызывающий код править не нужно.
+//
+// Особенности Claude Haiku 5.5 (по официальному migration guide):
+//  * temperature/top_p/top_k и prefill ассистента возвращают 400 — НЕ шлём.
+//  * Adaptive thinking включён по умолчанию, токены размышления входят в
+//    max_tokens, а ответ может начинаться с блока "thinking" — поэтому текст
+//    собираем из блоков type:"text", а не берём content[0].
+//  * Глубину размышления задаёт output_config.effort ("low" для простых
+//    задач извлечения полей — быстрее и дешевле).
+// ============================================================================
 
-const AI_FALLBACK_ENABLED = process.env.AI_FALLBACK_ENABLED === 'true';
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
-const SAMBANOVA_API_KEY = process.env.SAMBANOVA_API_KEY;
-const CLOUDFLARE_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
-const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_VERSION = '2023-06-01';
+const MISTRAL_URL = 'https://api.mistral.ai/v1/chat/completions';
 
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.6-flash';
-// llama-3.3-70b-versatile официально задепрекейчен Groq 17.06.2026
-// (см. console.groq.com/docs/deprecations) — вызовы к нему падают с
-// 404 model_decommissioned. Актуальная замена — openai/gpt-oss-120b.
-const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
-// openai/gpt-4o-mini — платная модель, на аккаунте без пополнения
-// падает с 402. openrouter/free — авто-роутер, сам подбирает бесплатную
-// модель из текущего живого списка (жёстко прибивать конкретный
-// :free-id рискованно — такие модели периодически снимают с
-// бесплатного тарифа без предупреждения).
-const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || 'openrouter/free';
-// Mistral Experiment tier — 1 млрд токенов/мес бесплатно, постоянный
-// (не разовый) лимит. mistral-small-latest — не reasoning-модель.
-const MISTRAL_MODEL = process.env.MISTRAL_MODEL || 'mistral-small-latest';
-// SambaNova Cloud free tier — без карты, независимые чипы (RDU), не
-// reasoning-модель. См. подробное обоснование в scraper/src/aiProviders.js.
-const SAMBANOVA_MODEL = process.env.SAMBANOVA_MODEL || 'Meta-Llama-3.3-70B-Instruct';
-// Cloudflare Workers AI free tier — 10 000 нейронов/день, без карты.
-// Требует CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN (два значения,
-// не один ключ). Edge-инфраструктура, независимая от остальных
-// провайдеров в цепочке. -fast вариант (не обычный instruct) —
-// Cloudflare задепрекейчила базовый 30.05.2026, см. подробности в
-// scraper/src/aiProviders.js.
-const CLOUDFLARE_MODEL = process.env.CLOUDFLARE_MODEL || '@cf/meta/llama-3.1-8b-instruct-fast';
+// max_tokens у Anthropic ограничивает размышления + текст. Billing идёт по
+// фактически сгенерированным токенам, а не по лимиту, поэтому запас ничего
+// не стоит, но защищает от пустого ответа (stop_reason: max_tokens).
+const THINKING_HEADROOM_TOKENS = 1024;
 
-// 20.08.2026: в проекте не было vercel.json — Vercel сам обрубает
-// serverless-функцию по своему дефолтному лимиту (10с на Hobby, чуть
-// больше на Pro), а вся эта цепочка была рассчитана на 40с ТАЙМАУТ
-// НА КАЖДОГО провайдера (см. DEFAULT_TIMEOUT_MS ниже) — то есть
-// платформа убивала функцию на середине первого же вызова к Gemini,
-// весь фолбэк на остальных 5 провайдеров попросту не успевал
-// начаться. Добавлен client/vercel.json (maxDuration: 60 — потолок
-// Hobby-плана без Fluid Compute) + таймауты здесь урезаны так, чтобы
-// вся цепочка из 6 провайдеров гарантированно укладывалась в эти 60с
-// даже в худшем случае (все провайдеры недоступны/долго отвечают).
-const DEFAULT_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS) || 8000;
-const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
-const PROVIDER_DELAY_MS = 250;
+const DEFAULT_TIMEOUT_MS = Number(process.env.AI_TIMEOUT_MS) || 15000;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504, 529]);
+const ANTHROPIC_MAX_ATTEMPTS = 2; // 1 повтор на 429/5xx/529, потом запасной
+const MAX_RETRY_WAIT_MS = 3000;
+
+// Если основной провайдер "лёг" надолго (неверный ключ, кончились деньги,
+// повторные 429) — не долбим его на каждом объявлении, а на 10 минут идём
+// сразу к запасному. Через 10 минут пробуем снова (в serverless-инстансе
+// состояние живёт недолго, в скрапере — не дольше одного прогона).
+const DISABLE_FOR_MS = 10 * 60 * 1000;
+const RATE_LIMIT_STREAK_LIMIT = 3;
+const disabledUntil = new Map(); // name -> timestamp
+const rateLimitStreak = new Map(); // name -> число 429 подряд
+
+function cfg() {
+  // Читаем ENV в момент вызова (а не при импорте) — проще тестировать и
+  // подхватывает значения, заданные после загрузки dotenv.
+  return {
+    anthropicKey: process.env.ANTHROPIC_API_KEY,
+    anthropicModel: process.env.ANTHROPIC_MODEL || 'claude-haiku-5-5',
+    // '' (пустая строка) = не отправлять output_config вообще (на случай,
+    // если ANTHROPIC_MODEL переопределён на модель без поддержки effort).
+    anthropicEffort: process.env.ANTHROPIC_EFFORT ?? 'low',
+    mistralKey: process.env.MISTRAL_API_KEY,
+    mistralModel: process.env.MISTRAL_MODEL || 'mistral-small-latest',
+    fallbackEnabled: process.env.AI_FALLBACK_ENABLED === 'true',
+  };
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -89,95 +82,161 @@ function parseJsonResponse(text) {
   return JSON.parse(cleanJsonText(text));
 }
 
-async function fetchJson(url, options, timeoutMs) {
+async function httpPostJson(url, headers, body, timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
     const bodyText = await res.text();
     if (!res.ok) {
       const err = new Error(`HTTP ${res.status}`);
-      err.response = { status: res.status, text: bodyText };
+      err.response = {
+        status: res.status,
+        text: bodyText,
+        retryAfter: res.headers?.get?.('retry-after') ?? null,
+      };
       throw err;
     }
     return JSON.parse(bodyText);
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      const e = new Error(`timeout ${timeoutMs}ms`);
+      e.isTimeout = true;
+      throw e;
+    }
+    throw err;
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
-async function callGemini({ model, systemPrompt, userText, timeoutMs, maxTokens = 300 }) {
-  // Раньше здесь было 2 попытки с sleep(800) между ними — при
-  // 6-провайдерной цепочке и бюджете в 60с (см. DEFAULT_TIMEOUT_MS
-  // выше и client/vercel.json) внутренний повтор именно у Gemini
-  // съедал непропорционально много времени за счёт одного и того же
-  // провайдера, хотя следующие 5 провайдеров в цепочке и так работают
-  // как повтор на случай сбоя. Одна попытка здесь + общий фолбэк
-  // дальше по цепочке даёт ту же устойчивость, но укладывается в
-  // бюджет по времени.
-  const data = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`,
-    {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ parts: [{ text: userText }] }],
-        // temperature/top_p/top_k задепрекейчены для текущих
-        // Gemini flash-моделей — не отправляем. thinkingLevel:'low'
-        // отключает лишнее "размышление" модели — ранее найденный
-        // фикс таймаутов, см. историю проекта.
-        generationConfig: {
-          responseMimeType: 'application/json',
-          maxOutputTokens: maxTokens,
-          thinkingConfig: { thinkingLevel: 'low' },
-        },
-      }),
-    },
-    timeoutMs
-  );
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) throw new Error('empty response');
-  return parseJsonResponse(text);
+async function callAnthropic({ systemPrompt, userText, timeoutMs, maxTokens }) {
+  const c = cfg();
+  const body = {
+    model: c.anthropicModel,
+    max_tokens: maxTokens + THINKING_HEADROOM_TOKENS,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userText }],
+    // Никаких temperature/top_p/top_k и prefill — на Haiku 5.5 это 400.
+    ...(c.anthropicEffort ? { output_config: { effort: c.anthropicEffort } } : {}),
+  };
+  const headers = { 'x-api-key': c.anthropicKey, 'anthropic-version': ANTHROPIC_VERSION };
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= ANTHROPIC_MAX_ATTEMPTS; attempt++) {
+    try {
+      const data = await httpPostJson(ANTHROPIC_URL, headers, body, timeoutMs);
+      // Ответ может начинаться с блока thinking — берём только text-блоки.
+      const blocks = Array.isArray(data?.content) ? data.content : [];
+      const text = blocks
+        .filter((b) => b?.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join('');
+      if (!text.trim()) {
+        throw new Error(
+          data?.stop_reason === 'max_tokens'
+            ? 'max_tokens исчерпан до появления текста (размышления)'
+            : `empty response (stop_reason=${data?.stop_reason ?? '?'})`
+        );
+      }
+      return {
+        data: parseJsonResponse(text),
+        usage: { input: data?.usage?.input_tokens ?? null, output: data?.usage?.output_tokens ?? null },
+      };
+    } catch (err) {
+      lastError = err;
+      const status = err?.response?.status;
+      // Повторяем только 429/5xx/529. Таймаут не повторяем — это съело бы
+      // бюджет времени (на Vercel лимит функции 60 с), идём к запасному.
+      const retryable = status && RETRYABLE_STATUSES.has(status);
+      if (attempt === ANTHROPIC_MAX_ATTEMPTS || !retryable) break;
+      const ra = Number(err.response.retryAfter);
+      await sleep(Math.min(MAX_RETRY_WAIT_MS, Number.isFinite(ra) && ra > 0 ? ra * 1000 : 600));
+    }
+  }
+  throw lastError || new Error('anthropic failed');
 }
 
-async function callOpenAICompatible({ baseUrl, apiKey, model, systemPrompt, userText, timeoutMs, maxTokens = 300, extraHeaders = {}, extraBody = {} }) {
-  const data = await fetchJson(
-    `${baseUrl.replace(/\/$/, '')}/chat/completions`,
+async function callMistral({ systemPrompt, userText, timeoutMs, maxTokens }) {
+  const c = cfg();
+  const data = await httpPostJson(
+    MISTRAL_URL,
+    { Authorization: `Bearer ${c.mistralKey}` },
     {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'content-type': 'application/json',
-        ...extraHeaders,
-      },
-      body: JSON.stringify({
-        model,
-        max_tokens: maxTokens,
-        temperature: 0,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userText },
-        ],
-        ...extraBody,
-      }),
+      model: c.mistralModel,
+      max_tokens: maxTokens,
+      temperature: 0,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userText },
+      ],
     },
     timeoutMs
   );
   const text = data?.choices?.[0]?.message?.content;
   if (!text) throw new Error('empty response');
-  return parseJsonResponse(text);
+  return {
+    data: parseJsonResponse(text),
+    usage: { input: data?.usage?.prompt_tokens ?? null, output: data?.usage?.completion_tokens ?? null },
+  };
 }
 
-function providerPlan() {
+function noteFailure(name, err) {
+  const status = err?.response?.status;
+  const text = String(err?.response?.text || '');
+
+  // Деньги кончились: Anthropic отвечает 400 "credit balance is too low".
+  const billing = status === 400 && /credit balance/i.test(text);
+  if (status === 401 || status === 403 || billing || status === 402) {
+    disabledUntil.set(name, Date.now() + DISABLE_FOR_MS);
+    console.error(
+      `AI: ${name} отключён на ${DISABLE_FOR_MS / 60000} мин — ` +
+        (billing || status === 402
+          ? 'НЕТ ДЕНЕГ НА СЧЕТУ, пополните баланс в консоли провайдера'
+          : `ключ неверный/отозван (HTTP ${status})`)
+    );
+    return;
+  }
+  if (status === 429) {
+    const streak = (rateLimitStreak.get(name) || 0) + 1;
+    rateLimitStreak.set(name, streak);
+    if (streak >= RATE_LIMIT_STREAK_LIMIT) {
+      disabledUntil.set(name, Date.now() + DISABLE_FOR_MS);
+      rateLimitStreak.set(name, 0);
+      console.warn(`AI: ${name} отключён на ${DISABLE_FOR_MS / 60000} мин (повторные 429)`);
+    }
+    return;
+  }
+  rateLimitStreak.set(name, 0);
+}
+
+function isActive(name) {
+  const until = disabledUntil.get(name);
+  if (!until) return true;
+  if (Date.now() >= until) {
+    disabledUntil.delete(name);
+    return true;
+  }
+  return false;
+}
+
+export function providerPlan() {
+  const c = cfg();
   const plan = [];
-  if (GEMINI_API_KEY) plan.push({ name: 'gemini' });
-  if (AI_FALLBACK_ENABLED && GROQ_API_KEY) plan.push({ name: 'groq' });
-  if (AI_FALLBACK_ENABLED && OPENROUTER_API_KEY) plan.push({ name: 'openrouter' });
-  if (AI_FALLBACK_ENABLED && MISTRAL_API_KEY) plan.push({ name: 'mistral' });
-  if (AI_FALLBACK_ENABLED && SAMBANOVA_API_KEY) plan.push({ name: 'sambanova' });
-  if (AI_FALLBACK_ENABLED && CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN) plan.push({ name: 'cloudflare' });
+  if (c.anthropicKey && isActive('anthropic')) plan.push({ name: 'anthropic', enabled: true });
+  if (c.fallbackEnabled && c.mistralKey && isActive('mistral')) plan.push({ name: 'mistral', enabled: true });
   return plan;
+}
+
+// Оставлено для совместимости с run.js (раньше решало, нужна ли длинная
+// пауза между объявлениями из-за лимитов Gemini).
+export function isProviderActiveThisRun(name) {
+  return isActive(name);
 }
 
 export async function runAiJsonChain({
@@ -192,92 +251,31 @@ export async function runAiJsonChain({
     return { ok: false, reason: 'unavailable', provider: null };
   }
 
+  const c = cfg();
+  const hasFallback = Boolean(c.fallbackEnabled && c.mistralKey);
   let lastError = null;
+
   for (const provider of plan) {
     try {
-      let data;
-      if (provider.name === 'gemini') {
-        data = await callGemini({ model: GEMINI_MODEL, systemPrompt, userText, timeoutMs, maxTokens });
-      } else if (provider.name === 'groq') {
-        data = await callOpenAICompatible({
-          baseUrl: 'https://api.groq.com/openai/v1',
-          apiKey: GROQ_API_KEY,
-          model: GROQ_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-          // openai/gpt-oss-* — reasoning-модели: без этого параметра
-          // они тратят токены на "размышления" до финального ответа и
-          // при небольшом max_tokens content приходит пустым ("empty
-          // response").
-          extraBody: /gpt-oss/.test(GROQ_MODEL) ? { reasoning_effort: 'low' } : {},
-        });
-      } else if (provider.name === 'openrouter') {
-        data = await callOpenAICompatible({
-          baseUrl: 'https://openrouter.ai/api/v1',
-          apiKey: OPENROUTER_API_KEY,
-          model: OPENROUTER_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-          extraHeaders: {
-            ...(process.env.OPENROUTER_HTTP_REFERER ? { 'HTTP-Referer': process.env.OPENROUTER_HTTP_REFERER } : {}),
-            ...(process.env.OPENROUTER_APP_TITLE ? { 'X-Title': process.env.OPENROUTER_APP_TITLE } : {}),
-          },
-          // openrouter/free сам выбирает бесплатную модель, часто тоже
-          // reasoning (DeepSeek/GLM/Qwen-thinking и т.п.) — тот же
-          // "empty response", что и с gpt-oss на Groq.
-          extraBody: { reasoning: { effort: 'low', exclude: true } },
-        });
-      } else if (provider.name === 'mistral') {
-        data = await callOpenAICompatible({
-          baseUrl: 'https://api.mistral.ai/v1',
-          apiKey: MISTRAL_API_KEY,
-          model: MISTRAL_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-        });
-      } else if (provider.name === 'sambanova') {
-        data = await callOpenAICompatible({
-          baseUrl: 'https://api.sambanova.ai/v1',
-          apiKey: SAMBANOVA_API_KEY,
-          model: SAMBANOVA_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-        });
-      } else if (provider.name === 'cloudflare') {
-        data = await callOpenAICompatible({
-          baseUrl: `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
-          apiKey: CLOUDFLARE_API_TOKEN,
-          model: CLOUDFLARE_MODEL,
-          systemPrompt,
-          userText,
-          timeoutMs,
-          maxTokens,
-        });
-      } else {
-        continue;
-      }
-      console.log(`${taskName}: provider ${provider.name} ok`);
-      return { ok: true, provider: provider.name, data };
+      const call = provider.name === 'anthropic' ? callAnthropic : callMistral;
+      const { data, usage } = await call({ systemPrompt, userText, timeoutMs, maxTokens });
+      rateLimitStreak.set(provider.name, 0);
+      console.log(
+        `${taskName}: provider ${provider.name} ok` +
+          (usage?.input != null ? ` (in ${usage.input} / out ${usage.output} tok)` : '')
+      );
+      return { ok: true, provider: provider.name, data, usage };
     } catch (err) {
       lastError = err;
       console.warn(`${taskName}: provider ${provider.name} failed (${err?.response?.status || err.message})`);
-      if (!AI_FALLBACK_ENABLED && provider.name === 'gemini') break;
-      if (provider.name === 'gemini' && !AI_FALLBACK_ENABLED && !RETRYABLE_STATUSES.has(err?.response?.status)) break;
-      await sleep(PROVIDER_DELAY_MS);
+      noteFailure(provider.name, err);
+      await sleep(150);
     }
   }
 
   return {
     ok: false,
-    reason: AI_FALLBACK_ENABLED ? 'fallback_exhausted' : 'bad_response',
+    reason: hasFallback ? 'fallback_exhausted' : 'bad_response',
     provider: null,
     error: lastError?.message || 'all providers failed',
   };

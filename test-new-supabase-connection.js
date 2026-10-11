@@ -44,21 +44,18 @@ async function main() {
     'bot_sessions',
     'team_members',
     'forum_topics',
-    'market_stats',
-    'market_stats_manual', // может отсутствовать — это нормально
     'listing_price_history',
   ];
 
   let allOk = true;
   for (const t of tables) {
     const ok = await check(t);
-    if (t !== 'market_stats_manual') allOk = allOk && ok;
+    allOk = allOk && ok;
   }
 
   console.log();
   if (allOk) {
     console.log('🎉 Подключение к новому Supabase работает, все ожидаемые таблицы на месте.');
-    console.log('   (market_stats_manual необязательна — если её нет, это нормально, см. db.js)');
   } else {
     console.log('⚠️  Что-то не так — проверьте, что весь migration_full_new_project.sql выполнен');
     console.log('   в SQL Editor нового проекта без ошибок, и что ключи скопированы верно.');

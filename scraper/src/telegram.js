@@ -75,45 +75,6 @@ function buildHashtags(listing) {
   return tags.filter(Boolean).join(' ');
 }
 
-function buildDealScoreBlock(listing) {
-  if (!listing?.deal_candidate && !(listing?.deal_score >= 70)) return '';
-
-  const tier =
-    listing.deal_score >= 90
-      ? '🔥 очень выгодное'
-      : listing.deal_score >= 80
-        ? '⚡ выгодное'
-        : listing.deal_score >= 70
-          ? '💡 потенциально выгодное'
-          : null;
-
-  const marketLine =
-    listing.below_market_pct != null
-      ? `Цена ниже рынка: ${Math.max(0, Number(listing.below_market_pct)).toFixed(1).replace(/\.0$/, '')}%\n`
-      : 'Цена ниже рынка: данных мало\n';
-  const ownerLine =
-    listing.owner_score != null ? `Owner Score: ${Math.round(Number(listing.owner_score))}/100\n` : '';
-  const historyLine =
-    listing.price_history_count > 1
-      ? `Цена снижалась: ${Math.max(0, Number(listing.price_drop_count) || 0)} раз\n`
-      : '';
-  const lastDropLine =
-    listing.last_price_change_pct != null
-      ? `Последнее изменение: ${Number(listing.last_price_change_pct).toFixed(1).replace(/\.0$/, '')}%\n`
-      : '';
-  const urgencyLine = listing.urgency_signal ? `Срочность: ${listing.urgency_phrase || 'есть сигнал'}\n` : '';
-
-  return (
-    `💎 Deal Score: ${Math.round(Number(listing.deal_score) || 0)}/100${tier ? ` · ${tier}` : ''}\n` +
-    marketLine +
-    ownerLine +
-    historyLine +
-    lastDropLine +
-    urgencyLine +
-    '\n'
-  );
-}
-
 /**
  * Собирает текст сообщения и кнопки — общая логика для обоих
  * назначений (основная группа с /find и тематические супергруппы).
@@ -121,7 +82,7 @@ function buildDealScoreBlock(listing) {
 // export — нужна отдельным разовым скриптам (см.
 // scripts/backfill-telegram-segment-labels.js), которые правят текст
 // УЖЕ отправленных сообщений задним числом, не переотправляя их.
-export function buildMessagePayload(listing, { includeDealScore = false } = {}) {
+export function buildMessagePayload(listing) {
   const roomsLine = listing.rooms ? `${listing.rooms}-комн. ` : '';
   const areaLine = listing.area ? `, ${listing.area} м²` : '';
   const districtLine = listing.district ? `📍 ${listing.district}\n` : '';
@@ -139,31 +100,9 @@ export function buildMessagePayload(listing, { includeDealScore = false } = {}) 
           ? '🏢 Похоже на агентство'
           : '❓ Сомнительно — проверьте сами';
 
-  // Строка про цену за м² и отклонение от медианы по району/городу —
-  // показываем и в обычном уведомлении, и в теме "Выгодные" (см.
-  // notifyDeal), чтобы было видно НАСКОЛЬКО ниже рынка, а не только
-  // сам факт. Для не-below_market объявлений с известной ценой/м² эту
-  // строку не показываем — незачем засорять обычные уведомления.
-  // Пометка сегмента (см. marketSegment.js) — показываем ТОЛЬКО когда
-  // он известен и был реально использован для более точного сравнения
-  // (см. evaluateDeal в marketStats.js). Цель — чтобы человек видел не
-  // только "%", но и с чем именно сравнивали: "вторичка к вторичке" —
-  // это гораздо надёжнее, чем весь район одним махом (где новостройки
-  // могут исказить медиану, см. пояснение в marketStats.js).
-  const segmentLabel =
-    listing.market_segment === 'secondary' ? ' (вторичка)' : listing.market_segment === 'new_build' ? ' (новостройка)' : '';
-  const belowMarketLine = listing.below_market
-    ? `🔥 На ${listing.below_market_pct}% ниже рыночной цены/м²${segmentLabel} (по ${listing.market_sample_size} объявл.)\n`
-    : '';
-  const urgencyLine = listing.urgency_signal ? `⚡ В тексте: «${listing.urgency_phrase}»\n` : '';
-  const dealScoreBlock = includeDealScore ? buildDealScoreBlock(listing) : '';
-
   const message =
     `🏠 Новое объявление (${listing.source})\n` +
     `${badge}\n\n` +
-    dealScoreBlock +
-    belowMarketLine +
-    urgencyLine +
     typeLine +
     `${roomsLine}${listing.title}${areaLine}\n` +
     `💰 ${listing.price || 'цена не указана'}\n` +
@@ -223,7 +162,7 @@ function trimToCaption(text, max = 1024) {
 
 /**
  * Общая точка отправки карточки объявления — используется во всех
- * трёх назначениях (основной чат, тематические супергруппы, "Выгодные").
+ * назначениях (основной чат и тематические супергруппы).
  *
  * 21.08.2026: раньше везде был bot.sendMessage с disable_web_page_preview:
  * false — карточка выглядела прилично только благодаря автоматическому
@@ -292,13 +231,6 @@ export const TOPIC_GROUPS = {
   commercial: (process.env.TELEGRAM_GROUP_COMMERCIAL || '').trim(),
   commercial_rent: (process.env.TELEGRAM_GROUP_COMMERCIAL_RENT || '').trim(),
   house: (process.env.TELEGRAM_GROUP_HOUSE || '').trim(),
-  // Отдельная супергруппа для объявлений "ниже рынка" (см.
-  // marketStats.js) — общая для всех типов недвижимости, темы внутри
-  // неё по-прежнему по району (см. notifyDeal ниже). Не участвует в
-  // resolveGroupKey()/notifyToTopicGroup() — их логика только про
-  // "куда объявление уходит по умолчанию", а сюда объявления уходят
-  // ДОПОЛНИТЕЛЬНО, см. вызов notifyDeal() в run.js.
-  deals: (process.env.TELEGRAM_GROUP_DEALS || '').trim(),
 };
 
 /**
@@ -364,43 +296,6 @@ export async function notifyToTopicGroup(listing) {
     return { chatId: String(sent.message.chat.id), messageId: sent.message.message_id };
   } catch (err) {
     console.error(`Не удалось отправить в тематическую супергруппу (${groupKey}):`, err.message);
-    return null;
-  }
-}
-
-/**
- * Дублирует объявление в супергруппу "Выгодные" (TELEGRAM_GROUP_DEALS),
- * в тему своего района внутри неё — используется ТОЛЬКО для
- * listing.below_market (см. вызов в run.js). Отдельная функция, а не
- * переиспользование notifyToTopicGroup(), потому что groupKey тут
- * всегда 'deals' независимо от property_type/deal_type объявления —
- * это не альтернативная классификация по типу, а отдельный сквозной
- * фильтр поверх всех типов сразу.
- */
-export async function notifyDeal(listing) {
-  const targetChatId = TOPIC_GROUPS.deals;
-  if (!bot || !targetChatId) {
-    // Раньше тут ничего не логировалось — из-за этого было непонятно,
-    // почему в супергруппу "Выгодные" ничего не приходит: то ли не
-    // настроен TELEGRAM_GROUP_DEALS, то ли бот вообще не поднялся, то
-    // ли реальная ошибка отправки. Теперь видно явно в логе прогона.
-    console.warn(
-      `[notifyDeal] Пропускаю отправку в "Выгодные" — ${!bot ? 'бот не инициализирован (нет TELEGRAM_BOT_TOKEN?)' : 'TELEGRAM_GROUP_DEALS не задан'}.`
-    );
-    return null;
-  }
-
-  const payload = buildMessagePayload(listing, { includeDealScore: true });
-  const messageThreadId = await getTopicId('deals', listing.district);
-
-  try {
-    const sent = await sendListingCard(targetChatId, listing, payload, {
-      ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
-    });
-    console.log(`[notifyDeal] Отправлено в "Выгодные" (район: ${listing.district || 'неизвестен'}): ${listing.title}`);
-    return { chatId: String(sent.message.chat.id), messageId: sent.message.message_id };
-  } catch (err) {
-    console.error('Не удалось отправить в супергруппу "Выгодные":', err.message);
     return null;
   }
 }
