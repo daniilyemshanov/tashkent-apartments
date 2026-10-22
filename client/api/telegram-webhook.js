@@ -34,6 +34,8 @@ import { parsePriceRange } from './_priceParser.js';
 import { buildListingText, buildListingButtons } from './_listingMessage.js';
 import { cleanAgentMessagesBatch } from './_cleanAgents.js';
 import { parseSearchQuery } from './_aiSearch.js';
+import { isDuplicateUpdate } from './_updateDedupe.js';
+import { throwOnSupabaseError } from './_dbErrors.js';
 
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 const EXCHANGE_RATE_USD_UZS = Number(process.env.EXCHANGE_RATE_USD_UZS) || 11990;
@@ -43,19 +45,25 @@ const SEARCH_WINDOW_DAYS = 14; // не тащим совсем старые об
 // ---------- session (bot_sessions table) ----------
 
 async function getSession(chatId, userId) {
-  const { data } = await supabase
+  const startedAt = Date.now();
+  const { data, error } = await supabase
     .from('bot_sessions')
     .select('state')
     .eq('chat_id', chatId)
     .eq('user_id', userId)
     .maybeSingle();
+  console.info(`[perf] db.getSession ${Date.now() - startedAt}ms${error ? ' error' : ''}`);
+  throwOnSupabaseError('getSession', error);
   return data?.state || null;
 }
 
 async function saveSession(chatId, userId, state) {
-  await supabase
+  const startedAt = Date.now();
+  const { error } = await supabase
     .from('bot_sessions')
     .upsert({ chat_id: chatId, user_id: userId, state, updated_at: new Date().toISOString() });
+  console.info(`[perf] db.saveSession ${Date.now() - startedAt}ms${error ? ' error' : ''}`);
+  throwOnSupabaseError('saveSession', error);
 }
 
 function displayName(from) {
@@ -68,19 +76,10 @@ function displayName(from) {
 // Не часть мастера поиска (bot_sessions) — работают на самих
 // сообщениях-объявлениях в супергруппах, независимо от сессии.
 
-async function refreshListingMessage(chatId, messageId, listingId) {
-  const { data: listing, error } = await supabase.from('listings').select('*').eq('id', listingId).maybeSingle();
-  if (error || !listing) {
-    console.error('Не удалось перечитать объявление для обновления карточки:', error?.message || 'не найдено');
-    return null;
-  }
-  // editMessageText по умолчанию просит Telegram парсить текст как
-  // HTML — а в тексте карточки есть "сырая" ссылка на объявление, в
-  // которой почти всегда есть символ "&" (разделитель параметров
-  // URL). Для HTML это служебный символ, из-за него Telegram
-  // отказывается парсить текст и правка тихо не применяется. Текст
-  // карточки и так без HTML-разметки (как и при первой отправке из
-  // scraper/telegram.js), поэтому здесь явно отключаем HTML-режим.
+const LISTING_MESSAGE_FIELDS =
+  'id, source, label_kind, flagged_agent, flagged_by, label_text, deal_type, property_type, rooms, title, area, price, district, phone, assigned_to, contacted, contacted_by, notes, url';
+
+async function editListingMessage(chatId, messageId, listing) {
   await editMessageText(chatId, messageId, buildListingText(listing), {
     parse_mode: undefined,
     reply_markup: { inline_keyboard: buildListingButtons(listing) },
@@ -88,38 +87,66 @@ async function refreshListingMessage(chatId, messageId, listingId) {
   return listing;
 }
 
-async function toggleContacted(chatId, messageId, listingId, agentName, callbackId) {
-  const { data: current } = await supabase.from('listings').select('contacted').eq('id', listingId).maybeSingle();
-  const next = !current?.contacted;
-  await supabase
+async function refreshListingMessage(chatId, messageId, listingId) {
+  const startedAt = Date.now();
+  const { data: listing, error } = await supabase
+    .from('listings')
+    .select(LISTING_MESSAGE_FIELDS)
+    .eq('id', listingId)
+    .maybeSingle();
+  console.info(`[perf] db.refreshListing ${Date.now() - startedAt}ms${error ? ' error' : ''}`);
+  throwOnSupabaseError('refreshListingMessage', error);
+  if (!listing) {
+    console.error('Не удалось перечитать объявление для обновления карточки: не найдено');
+    return null;
+  }
+  return editListingMessage(chatId, messageId, listing);
+}
+
+async function toggleContacted(chatId, messageId, listingId, agentName) {
+  const readStartedAt = Date.now();
+  const { data: current, error: readError } = await supabase
+    .from('listings').select('contacted').eq('id', listingId).maybeSingle();
+  console.info(`[perf] db.toggleContacted.read ${Date.now() - readStartedAt}ms${readError ? ' error' : ''}`);
+  throwOnSupabaseError('toggleContacted.read', readError);
+  if (!current) throw new Error('Объявление не найдено для отметки контакта');
+  const next = !current.contacted;
+  const updateStartedAt = Date.now();
+  const { data: listing, error: updateError } = await supabase
     .from('listings')
     .update({
       contacted: next,
       contacted_by: next ? agentName : null,
       contacted_at: next ? new Date().toISOString() : null,
     })
-    .eq('id', listingId);
-  await refreshListingMessage(chatId, messageId, listingId);
-  await answerCallbackQuery(callbackId, next ? '✅ Отмечено' : 'Отметка снята');
+    .eq('id', listingId)
+    .select(LISTING_MESSAGE_FIELDS)
+    .maybeSingle();
+  console.info(`[perf] db.toggleContacted.update ${Date.now() - updateStartedAt}ms${updateError ? ' error' : ''}`);
+  throwOnSupabaseError('toggleContacted.update', updateError);
+  if (listing) await editListingMessage(chatId, messageId, listing);
 }
 
-async function toggleAssigned(chatId, messageId, listingId, agentName, callbackId) {
-  const { data: current } = await supabase.from('listings').select('assigned_to').eq('id', listingId).maybeSingle();
-  if (current?.assigned_to && current.assigned_to !== agentName) {
-    // Уже кто-то другой взял в работу — не перехватываем молча, а
-    // показываем всплывающее уведомление, чтобы не звонили вдвоём.
-    await answerCallbackQuery(callbackId, `Уже взял в работу: ${current.assigned_to}`);
-    return;
-  }
-  const next = current?.assigned_to ? null : agentName; // повторное нажатие тем же агентом — освобождает
-  await supabase
+async function toggleAssigned(chatId, messageId, listingId, agentName) {
+  const readStartedAt = Date.now();
+  const { data: current, error: readError } = await supabase
+    .from('listings').select('assigned_to').eq('id', listingId).maybeSingle();
+  console.info(`[perf] db.toggleAssigned.read ${Date.now() - readStartedAt}ms${readError ? ' error' : ''}`);
+  throwOnSupabaseError('toggleAssigned.read', readError);
+  if (!current) throw new Error('Объявление не найдено для назначения');
+  if (current.assigned_to && current.assigned_to !== agentName) return;
+  const next = current.assigned_to ? null : agentName;
+  const updateStartedAt = Date.now();
+  const { data: listing, error: updateError } = await supabase
     .from('listings')
     .update({ assigned_to: next, assigned_at: next ? new Date().toISOString() : null })
-    .eq('id', listingId);
-  await refreshListingMessage(chatId, messageId, listingId);
-  await answerCallbackQuery(callbackId, next ? '👤 Взято в работу' : 'Освобождено');
+    .eq('id', listingId)
+    .select(LISTING_MESSAGE_FIELDS)
+    .maybeSingle();
+  console.info(`[perf] db.toggleAssigned.update ${Date.now() - updateStartedAt}ms${updateError ? ' error' : ''}`);
+  throwOnSupabaseError('toggleAssigned.update', updateError);
+  if (listing) await editListingMessage(chatId, messageId, listing);
 }
-
 
 
 function dealTypeKeyboard() {
@@ -223,18 +250,26 @@ function threadExtra(threadId) {
   return threadId ? { message_thread_id: threadId } : {};
 }
 
-async function toggleFlaggedAgent(chatId, messageId, listingId, agentName, callbackId) {
-  const { data: current } = await supabase.from('listings').select('flagged_agent').eq('id', listingId).maybeSingle();
-  const next = !current?.flagged_agent;
-  await supabase
+async function toggleFlaggedAgent(chatId, messageId, listingId, agentName) {
+  const readStartedAt = Date.now();
+  const { data: current, error: readError } = await supabase
+    .from('listings').select('flagged_agent, label_kind').eq('id', listingId).maybeSingle();
+  console.info(`[perf] db.toggleFlagged.read ${Date.now() - readStartedAt}ms${readError ? ' error' : ''}`);
+  throwOnSupabaseError('toggleFlaggedAgent.read', readError);
+  if (!current) throw new Error('Объявление не найдено для изменения метки');
+  const next = !current.flagged_agent;
+  const updateStartedAt = Date.now();
+  const { error: updateError } = await supabase
     .from('listings')
     .update({
       flagged_agent: next,
       flagged_by: next ? agentName : null,
       flagged_at: next ? new Date().toISOString() : null,
-      label_kind: next ? 'agent' : current?.label_kind, // синхронизируем с label_kind, чтобы recheck-owners.js/delete-agent-messages.js тоже видели это как агента
+      label_kind: next ? 'agent' : current.label_kind,
     })
     .eq('id', listingId);
+  console.info(`[perf] db.toggleFlagged.update ${Date.now() - updateStartedAt}ms${updateError ? ' error' : ''}`);
+  throwOnSupabaseError('toggleFlaggedAgent.update', updateError);
 
   if (next) {
     // Раньше тут просто обновлялась карточка (бейдж "Похоже на
@@ -246,20 +281,18 @@ async function toggleFlaggedAgent(chatId, messageId, listingId, agentName, callb
     // сообщение всё равно уже отправлено один раз в прошлом.
     const deleted = await deleteMessage(chatId, messageId);
     if (deleted) {
-      await supabase.from('listings').update({ telegram_deleted: true }).eq('id', listingId);
-      await answerCallbackQuery(callbackId, '🚫 Отмечено как агентство — сообщение удалено');
+      const { error: deletedError } = await supabase.from('listings').update({ telegram_deleted: true }).eq('id', listingId);
+      throwOnSupabaseError('toggleFlaggedAgent.markDeleted', deletedError);
       return;
     }
     // Не удалилось (например, сообщению больше 48 часов — Telegram
     // сам такое запрещает удалять ботам) — хотя бы обновляем карточку,
     // как раньше, чтобы было видно пометку.
     await refreshListingMessage(chatId, messageId, listingId);
-    await answerCallbackQuery(callbackId, '🚫 Отмечено как агентство (удалить сообщение не удалось — попробуйте вручную)');
     return;
   }
 
   await refreshListingMessage(chatId, messageId, listingId);
-  await answerCallbackQuery(callbackId, 'Пометка снята');
 }
 
 // Заметки не пишутся мастером/кнопками (Telegram не даёт открыть
@@ -360,7 +393,14 @@ function listingPriceUzs(l) {
 // ---------- search ----------
 
 async function runSearch(filters) {
-  let query = supabase.from('listings').select('*').order('created_at', { ascending: false }).range(0, 999);
+  // Выбираем только поля, которые реально нужны поиску и карточкам.
+  // select('*') загружал десятки полей на каждое объявление, хотя сессия
+  // хранит максимум 100 результатов; это лишний трафик и JSON-парсинг.
+  let query = supabase
+    .from('listings')
+    .select('id, title, price, district, rooms, area, url, label_kind, created_at, price_value, price_currency, raw_text')
+    .order('created_at', { ascending: false })
+    .range(0, 999);
 
   // Агентства (label_kind='agent') не показываем — как и на сайте/в
   // push-уведомлениях, их снова полностью скрываем.
@@ -389,7 +429,9 @@ async function runSearch(filters) {
   const cutoff = new Date(Date.now() - SEARCH_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
   query = query.gte('created_at', cutoff);
 
+  const dbStartedAt = Date.now();
   const { data, error } = await query;
+  console.info(`[perf] db.runSearch ${Date.now() - dbStartedAt}ms rows=${data?.length ?? 0}${error ? ' error' : ''}`);
   if (error) {
     console.error('Ошибка поиска в Supabase:', error.message);
     return [];
@@ -484,6 +526,8 @@ async function startWizard(chatId, userId, existingMessageId, threadId) {
 
 async function handleCallback(update) {
   const cb = update.callback_query;
+  // Inline callbacks без message не поддерживаются этим мастером.
+  if (!cb?.message || !cb?.from?.id) return;
   const data = cb.data || '';
   const chatId = cb.message.chat.id;
   const userId = cb.from.id;
@@ -493,24 +537,21 @@ async function handleCallback(update) {
   // часть мастера поиска, обрабатываем сразу и выходим, до всей
   // остальной логики сессий ниже.
   if (data.startsWith('ct:')) {
-    await toggleContacted(chatId, messageId, data.slice(3), displayName(cb.from), cb.id);
+    await toggleContacted(chatId, messageId, data.slice(3), displayName(cb.from));
     return;
   }
   if (data.startsWith('as:')) {
-    await toggleAssigned(chatId, messageId, data.slice(3), displayName(cb.from), cb.id);
+    await toggleAssigned(chatId, messageId, data.slice(3), displayName(cb.from));
     return;
   }
   if (data.startsWith('fl:')) {
-    await toggleFlaggedAgent(chatId, messageId, data.slice(3), displayName(cb.from), cb.id);
+    await toggleFlaggedAgent(chatId, messageId, data.slice(3), displayName(cb.from));
     return;
   }
   if (data.startsWith('nt:')) {
     await promptForNote(chatId, messageId, data.slice(3), userId, cb.message.message_thread_id);
-    await answerCallbackQuery(cb.id);
     return;
   }
-
-  await answerCallbackQuery(cb.id);
 
   if (data === 'new') {
     await startWizard(chatId, userId, messageId);
@@ -615,10 +656,10 @@ function parseAreaRange(text) {
   return null;
 }
 
-async function handleAreaTextReply(message) {
+async function handleAreaTextReply(message, loadedSession) {
   const chatId = message.chat.id;
   const userId = message.from.id;
-  const session = await getSession(chatId, userId);
+  const session = loadedSession === undefined ? await getSession(chatId, userId) : loadedSession;
   if (!session || session.step !== 'area') return false;
 
   const parsed = parseAreaRange(message.text);
@@ -638,10 +679,10 @@ async function handleAreaTextReply(message) {
   return true;
 }
 
-async function handlePriceTextReply(message) {
+async function handlePriceTextReply(message, loadedSession) {
   const chatId = message.chat.id;
   const userId = message.from.id;
-  const session = await getSession(chatId, userId);
+  const session = loadedSession === undefined ? await getSession(chatId, userId) : loadedSession;
   if (!session) return false;
 
   // Раньше это работало ТОЛЬКО сразу после шага "Диапазон цены?"
@@ -877,21 +918,23 @@ async function handleMessage(message) {
     return;
   }
   if (message.text && !cmd) {
-    if (await handleAreaTextReply(message)) return;
-    await handlePriceTextReply(message);
+    // Загружаем сессию один раз: раньше обычный текст мог вызвать два
+    // последовательных SELECT (area, затем price) даже когда шаг не совпадал.
+    const session = await getSession(message.chat.id, message.from.id);
+    if (await handleAreaTextReply(message, session)) return;
+    await handlePriceTextReply(message, session);
   }
 }
 
 // ---------- entrypoint ----------
 
 export default async function handler(req, res) {
+  const requestStartedAt = Date.now();
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'method not allowed' });
     return;
   }
 
-  // Вебхук всегда должен требовать TELEGRAM_WEBHOOK_SECRET — если переменная не задана,
-  // отказываем всем запросам вместо того, чтобы молча принимать неподписанные апдейты.
   const got = req.headers['x-telegram-bot-api-secret-token'];
   if (!WEBHOOK_SECRET || got !== WEBHOOK_SECRET) {
     res.status(401).json({ error: 'bad secret token' });
@@ -899,21 +942,32 @@ export default async function handler(req, res) {
   }
 
   const update = req.body;
+  if (isDuplicateUpdate(update?.update_id)) {
+    console.info('[perf] webhook duplicate update skipped');
+    res.status(200).json({ ok: true, duplicate: true });
+    return;
+  }
+
   try {
     if (update?.callback_query) {
+      // Telegram requires a callback acknowledgement quickly. Do this before
+      // any Supabase reads, edits, or business logic, and exactly once.
+      const callbackId = update.callback_query.id;
+      try {
+        await answerCallbackQuery(callbackId);
+      } catch (ackError) {
+        console.error('[telegram] callback acknowledgement transport failure:', ackError.message);
+      }
+      const callbackStartedAt = Date.now();
       await handleCallback(update);
+      console.info(`[perf] business.callback ${Date.now() - callbackStartedAt}ms`);
     } else if (update?.message) {
+      const messageStartedAt = Date.now();
       await handleMessage(update.message);
+      console.info(`[perf] business.message ${Date.now() - messageStartedAt}ms`);
     }
   } catch (err) {
     console.error('Ошибка обработки Telegram-апдейта:', err);
-    // Раньше ошибка тут просто уходила в серверный лог, а пользователь
-    // не получал вообще никакой реакции — снаружи выглядело как "бот
-    // завис" (жалоба 20.08.2026: после ввода диапазона цены в /find
-    // тишина). Теперь дополнительно пытаемся сообщить об этом в чат.
-    // best-effort и в своём try/catch: если сама отправка тоже упадёт
-    // (например Telegram недоступен), не роняем обработку апдейта
-    // второй раз — Telegram всё равно должен получить 200 OK ниже.
     const chatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id;
     const threadId = update?.message?.message_thread_id ?? update?.callback_query?.message?.message_thread_id;
     if (chatId) {
@@ -924,12 +978,12 @@ export default async function handler(req, res) {
           threadExtra(threadId)
         );
       } catch (sendErr) {
-        console.error('Не удалось отправить сообщение об ошибке:', sendErr);
+        console.error('Не удалось отправить сообщение об ошибке:', sendErr.message);
       }
     }
+  } finally {
+    console.info(`[perf] webhook ${Date.now() - requestStartedAt}ms type=${update?.callback_query ? 'callback' : update?.message ? 'message' : 'other'}`);
   }
 
-  // Telegram ждёт 200 OK независимо от результата обработки — иначе
-  // будет повторять доставку того же апдейта.
   res.status(200).json({ ok: true });
 }

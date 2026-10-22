@@ -14,21 +14,32 @@ function assertConfigured() {
 
 async function call(method, payload) {
   assertConfigured();
-  const res = await fetch(`${API}/${method}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    // Telegram возвращает это, когда текст и клавиатура уже совпадают
-    // с запрошенными. Это штатный no-op: не логируем и не повторяем
-    // запрос. Все остальные ответы об ошибках остаются видимыми в логах.
-    if (!/message is not modified/i.test(data.description || '')) {
-      console.error(`Telegram API ошибка (${method}):`, data.description);
+  const startedAt = Date.now();
+  try {
+    const res = await fetch(`${API}/${method}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(method === 'answerCallbackQuery' ? 2500 : 10000),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      const description = data.description || '';
+      const expectedNoop =
+        /message is not modified/i.test(description) ||
+        (method === 'answerCallbackQuery' && /query is too old|query id is invalid|response timeout expired/i.test(description));
+      // Эти ответы означают, что действие уже не применимо. Не повторяем
+      // запрос: остальные API-ошибки по-прежнему остаются в логах.
+      if (!expectedNoop) console.error(`Telegram API ошибка (${method}):`, description);
     }
+    console.info(`[perf] telegram.${method} ${Date.now() - startedAt}ms${res.ok ? '' : ' http_error'}`);
+    return data;
+  } catch (error) {
+    const message = String(error?.message || 'unknown transport error');
+    const safeMessage = TOKEN ? message.split(TOKEN).join('[redacted]') : message;
+    console.error(`[telegram] ${method} transport failure after ${Date.now() - startedAt}ms:`, safeMessage);
+    throw new Error(safeMessage);
   }
-  return data;
 }
 
 export function sendMessage(chatId, text, extra = {}) {
