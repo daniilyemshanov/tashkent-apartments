@@ -21,7 +21,12 @@ async function call(method, payload) {
   });
   const data = await res.json();
   if (!data.ok) {
-    console.error(`Telegram API ошибка (${method}):`, data.description);
+    // Telegram возвращает это, когда текст и клавиатура уже совпадают
+    // с запрошенными. Это штатный no-op: не логируем и не повторяем
+    // запрос. Все остальные ответы об ошибках остаются видимыми в логах.
+    if (!/message is not modified/i.test(data.description || '')) {
+      console.error(`Telegram API ошибка (${method}):`, data.description);
+    }
   }
   return data;
 }

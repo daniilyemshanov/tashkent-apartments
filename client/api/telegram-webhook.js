@@ -279,6 +279,12 @@ async function promptForNote(chatId, cardMessageId, listingId, userId, threadId)
 }
 
 async function tryHandleNoteReply(message) {
+  // Большинство апдейтов (включая /start и обычные команды) не являются
+  // ответом на prompt заметки. Не ходим в Supabase за bot_sessions для
+  // каждого такого сообщения: это лишний сетевой round-trip перед
+  // обработкой даже самых простых команд.
+  if (!message.reply_to_message || !message.text || !message.from) return false;
+
   const chatId = message.chat.id;
   const userId = message.from.id;
   const session = await getSession(chatId, userId);
