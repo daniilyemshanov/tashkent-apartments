@@ -35,6 +35,7 @@ import { buildListingText, buildListingButtons } from './_listingMessage.js';
 import { cleanAgentMessagesBatch } from './_cleanAgents.js';
 import { parseSearchQuery } from './_aiSearch.js';
 import { runChatHelper, getHint, HELP_TEXT, menuKeyboard } from './_chatHelper.js';
+import { isDuplicateUpdate } from './_updateDedupe.js';
 
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 const EXCHANGE_RATE_USD_UZS = Number(process.env.EXCHANGE_RATE_USD_UZS) || 11990;
@@ -1104,4 +1105,61 @@ async function handleMessage(message) {
   } catch (err) {
     console.error('Ошибка помощника по чату:', err);
   }
+}
+
+// ---------- entrypoint ----------
+
+export default async function handler(req, res) {
+  if (req.method !== 'POST') {
+    res.status(405).json({ error: 'method not allowed' });
+    return;
+  }
+
+  // Вебхук всегда должен требовать TELEGRAM_WEBHOOK_SECRET — если переменная не задана,
+  // отказываем всем запросам вместо того, чтобы молча принимать неподписанные апдейты.
+  const got = req.headers['x-telegram-bot-api-secret-token'];
+  if (!WEBHOOK_SECRET || got !== WEBHOOK_SECRET) {
+    res.status(401).json({ error: 'bad secret token' });
+    return;
+  }
+
+  const update = req.body;
+  if (isDuplicateUpdate(update?.update_id)) {
+    res.status(200).json({ ok: true, duplicate: true });
+    return;
+  }
+
+  try {
+    if (update?.callback_query) {
+      await handleCallback(update);
+    } else if (update?.message) {
+      await handleMessage(update.message);
+    }
+  } catch (err) {
+    console.error('Ошибка обработки Telegram-апдейта:', err);
+    // Раньше ошибка тут просто уходила в серверный лог, а пользователь
+    // не получал вообще никакой реакции — снаружи выглядело как "бот
+    // завис" (жалоба 20.08.2026: после ввода диапазона цены в /find
+    // тишина). Теперь дополнительно пытаемся сообщить об этом в чат.
+    // best-effort и в своём try/catch: если сама отправка тоже упадёт
+    // (например Telegram недоступен), не роняем обработку апдейта
+    // второй раз — Telegram всё равно должен получить 200 OK ниже.
+    const chatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id;
+    const threadId = update?.message?.message_thread_id ?? update?.callback_query?.message?.message_thread_id;
+    if (chatId) {
+      try {
+        await sendMessage(
+          chatId,
+          '⚠️ Что-то пошло не так при обработке запроса. Попробуйте ещё раз или начните заново: /find',
+          threadExtra(threadId)
+        );
+      } catch (sendErr) {
+        console.error('Не удалось отправить сообщение об ошибке:', sendErr);
+      }
+    }
+  }
+
+  // Telegram ждёт 200 OK независимо от результата обработки — иначе
+  // будет повторять доставку того же апдейта.
+  res.status(200).json({ ok: true });
 }
