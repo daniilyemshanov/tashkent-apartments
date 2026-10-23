@@ -77,3 +77,9 @@ export function parsePriceRange(text) {
 
   return null;
 }
+
+/** Указал ли человек валюту явно ($, у.е., usd, сум, млн/млрд) — иначе валюта угадана по величине числа. */
+export function hasExplicitCurrency(text) {
+  const raw = String(text || '');
+  return USD_MARKERS.test(raw) || UZS_MARKERS.test(raw) || BILLION.test(raw) || MILLION.test(raw);
+}

@@ -30,12 +30,11 @@
 import { supabase } from './_supabase.js';
 import { sendMessage, editMessageText, answerCallbackQuery, escapeHtml, deleteMessage } from './_telegramApi.js';
 import { DISTRICTS, districtSlug, districtFromSlug } from './_districts.js';
-import { parsePriceRange } from './_priceParser.js';
+import { parsePriceRange, hasExplicitCurrency } from './_priceParser.js';
 import { buildListingText, buildListingButtons } from './_listingMessage.js';
 import { cleanAgentMessagesBatch } from './_cleanAgents.js';
 import { parseSearchQuery } from './_aiSearch.js';
-import { isDuplicateUpdate } from './_updateDedupe.js';
-import { throwOnSupabaseError } from './_dbErrors.js';
+import { runChatHelper, getHint, HELP_TEXT, menuKeyboard } from './_chatHelper.js';
 
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 const EXCHANGE_RATE_USD_UZS = Number(process.env.EXCHANGE_RATE_USD_UZS) || 11990;
@@ -45,25 +44,19 @@ const SEARCH_WINDOW_DAYS = 14; // не тащим совсем старые об
 // ---------- session (bot_sessions table) ----------
 
 async function getSession(chatId, userId) {
-  const startedAt = Date.now();
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from('bot_sessions')
     .select('state')
     .eq('chat_id', chatId)
     .eq('user_id', userId)
     .maybeSingle();
-  console.info(`[perf] db.getSession ${Date.now() - startedAt}ms${error ? ' error' : ''}`);
-  throwOnSupabaseError('getSession', error);
   return data?.state || null;
 }
 
 async function saveSession(chatId, userId, state) {
-  const startedAt = Date.now();
-  const { error } = await supabase
+  await supabase
     .from('bot_sessions')
-    .upsert({ chat_id: chatId, user_id: userId, state, updated_at: new Date().toISOString() });
-  console.info(`[perf] db.saveSession ${Date.now() - startedAt}ms${error ? ' error' : ''}`);
-  throwOnSupabaseError('saveSession', error);
+    .upsert({ chat_id: chatId, user_id: userId, state: { ...state, ts: Date.now() }, updated_at: new Date().toISOString() });
 }
 
 function displayName(from) {
@@ -76,10 +69,19 @@ function displayName(from) {
 // Не часть мастера поиска (bot_sessions) — работают на самих
 // сообщениях-объявлениях в супергруппах, независимо от сессии.
 
-const LISTING_MESSAGE_FIELDS =
-  'id, source, label_kind, flagged_agent, flagged_by, label_text, deal_type, property_type, rooms, title, area, price, district, phone, assigned_to, contacted, contacted_by, notes, url';
-
-async function editListingMessage(chatId, messageId, listing) {
+async function refreshListingMessage(chatId, messageId, listingId) {
+  const { data: listing, error } = await supabase.from('listings').select('*').eq('id', listingId).maybeSingle();
+  if (error || !listing) {
+    console.error('Не удалось перечитать объявление для обновления карточки:', error?.message || 'не найдено');
+    return null;
+  }
+  // editMessageText по умолчанию просит Telegram парсить текст как
+  // HTML — а в тексте карточки есть "сырая" ссылка на объявление, в
+  // которой почти всегда есть символ "&" (разделитель параметров
+  // URL). Для HTML это служебный символ, из-за него Telegram
+  // отказывается парсить текст и правка тихо не применяется. Текст
+  // карточки и так без HTML-разметки (как и при первой отправке из
+  // scraper/telegram.js), поэтому здесь явно отключаем HTML-режим.
   await editMessageText(chatId, messageId, buildListingText(listing), {
     parse_mode: undefined,
     reply_markup: { inline_keyboard: buildListingButtons(listing) },
@@ -87,66 +89,38 @@ async function editListingMessage(chatId, messageId, listing) {
   return listing;
 }
 
-async function refreshListingMessage(chatId, messageId, listingId) {
-  const startedAt = Date.now();
-  const { data: listing, error } = await supabase
-    .from('listings')
-    .select(LISTING_MESSAGE_FIELDS)
-    .eq('id', listingId)
-    .maybeSingle();
-  console.info(`[perf] db.refreshListing ${Date.now() - startedAt}ms${error ? ' error' : ''}`);
-  throwOnSupabaseError('refreshListingMessage', error);
-  if (!listing) {
-    console.error('Не удалось перечитать объявление для обновления карточки: не найдено');
-    return null;
-  }
-  return editListingMessage(chatId, messageId, listing);
-}
-
-async function toggleContacted(chatId, messageId, listingId, agentName) {
-  const readStartedAt = Date.now();
-  const { data: current, error: readError } = await supabase
-    .from('listings').select('contacted').eq('id', listingId).maybeSingle();
-  console.info(`[perf] db.toggleContacted.read ${Date.now() - readStartedAt}ms${readError ? ' error' : ''}`);
-  throwOnSupabaseError('toggleContacted.read', readError);
-  if (!current) throw new Error('Объявление не найдено для отметки контакта');
-  const next = !current.contacted;
-  const updateStartedAt = Date.now();
-  const { data: listing, error: updateError } = await supabase
+async function toggleContacted(chatId, messageId, listingId, agentName, callbackId) {
+  const { data: current } = await supabase.from('listings').select('contacted').eq('id', listingId).maybeSingle();
+  const next = !current?.contacted;
+  await supabase
     .from('listings')
     .update({
       contacted: next,
       contacted_by: next ? agentName : null,
       contacted_at: next ? new Date().toISOString() : null,
     })
-    .eq('id', listingId)
-    .select(LISTING_MESSAGE_FIELDS)
-    .maybeSingle();
-  console.info(`[perf] db.toggleContacted.update ${Date.now() - updateStartedAt}ms${updateError ? ' error' : ''}`);
-  throwOnSupabaseError('toggleContacted.update', updateError);
-  if (listing) await editListingMessage(chatId, messageId, listing);
+    .eq('id', listingId);
+  await refreshListingMessage(chatId, messageId, listingId);
+  await answerCallbackQuery(callbackId, next ? '✅ Отмечено' : 'Отметка снята');
 }
 
-async function toggleAssigned(chatId, messageId, listingId, agentName) {
-  const readStartedAt = Date.now();
-  const { data: current, error: readError } = await supabase
-    .from('listings').select('assigned_to').eq('id', listingId).maybeSingle();
-  console.info(`[perf] db.toggleAssigned.read ${Date.now() - readStartedAt}ms${readError ? ' error' : ''}`);
-  throwOnSupabaseError('toggleAssigned.read', readError);
-  if (!current) throw new Error('Объявление не найдено для назначения');
-  if (current.assigned_to && current.assigned_to !== agentName) return;
-  const next = current.assigned_to ? null : agentName;
-  const updateStartedAt = Date.now();
-  const { data: listing, error: updateError } = await supabase
+async function toggleAssigned(chatId, messageId, listingId, agentName, callbackId) {
+  const { data: current } = await supabase.from('listings').select('assigned_to').eq('id', listingId).maybeSingle();
+  if (current?.assigned_to && current.assigned_to !== agentName) {
+    // Уже кто-то другой взял в работу — не перехватываем молча, а
+    // показываем всплывающее уведомление, чтобы не звонили вдвоём.
+    await answerCallbackQuery(callbackId, `Уже взял в работу: ${current.assigned_to}`);
+    return;
+  }
+  const next = current?.assigned_to ? null : agentName; // повторное нажатие тем же агентом — освобождает
+  await supabase
     .from('listings')
     .update({ assigned_to: next, assigned_at: next ? new Date().toISOString() : null })
-    .eq('id', listingId)
-    .select(LISTING_MESSAGE_FIELDS)
-    .maybeSingle();
-  console.info(`[perf] db.toggleAssigned.update ${Date.now() - updateStartedAt}ms${updateError ? ' error' : ''}`);
-  throwOnSupabaseError('toggleAssigned.update', updateError);
-  if (listing) await editListingMessage(chatId, messageId, listing);
+    .eq('id', listingId);
+  await refreshListingMessage(chatId, messageId, listingId);
+  await answerCallbackQuery(callbackId, next ? '👤 Взято в работу' : 'Освобождено');
 }
+
 
 
 function dealTypeKeyboard() {
@@ -188,19 +162,72 @@ function roomsKeyboard(selected) {
   ];
 }
 
-function priceKeyboard() {
-  return [[{ text: '💸 Без ограничений по цене', callback_data: 'p:any' }]];
+// Шаг цены. Раньше тут была одна кнопка «без ограничений» и просьба «ответьте
+// (Reply)» — многие не понимали, что и как писать. Теперь: готовые диапазоны
+// кнопками (в долларах, под тип сделки и недвижимости), «свой диапазон» с
+// примерами и «не важно». Reply не нужен — достаточно обычного сообщения.
+function fmtNum(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, '\u00A0');
 }
 
-const PRICE_STEP_TEXT =
-  'Диапазон цены?\n\nОтветьте (Reply) на это сообщение, например: <code>300-800 млн</code>, <code>от 2 млрд</code>, <code>500-1500$</code> — или нажмите кнопку ниже, если цена неважна.';
+function presetRows(edges, unit, prefix) {
+  const buttons = [];
+  buttons.push({ text: `до ${fmtNum(edges[0])}${unit}`, callback_data: `${prefix}:-${edges[0]}` });
+  for (let i = 0; i < edges.length - 1; i++) {
+    buttons.push({ text: `${fmtNum(edges[i])}–${fmtNum(edges[i + 1])}${unit}`, callback_data: `${prefix}:${edges[i]}-${edges[i + 1]}` });
+  }
+  const last = edges[edges.length - 1];
+  buttons.push({ text: `от ${fmtNum(last)}${unit}`, callback_data: `${prefix}:${last}-` });
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  return rows;
+}
 
-const AREA_STEP_TEXT =
-  'Площадь, м²?\n\nОтветьте (Reply) на это сообщение, например: <code>50-100</code>, <code>от 200</code> — или нажмите кнопку ниже, если площадь неважна.';
+function priceEdges(filters) {
+  const rent = filters?.dealType === 'rent';
+  const commercial = filters?.propertyType === 'commercial';
+  if (rent) return commercial ? [500, 1500, 3000] : [300, 500, 800, 1200];
+  return commercial ? [50000, 150000, 300000] : [40000, 70000, 100000, 150000];
+}
+
+function priceKeyboard(filters) {
+  return [
+    ...presetRows(priceEdges(filters), '$', 'pp'),
+    [{ text: '✍️ Свой диапазон', callback_data: 'pc' }, { text: '💸 Не важно', callback_data: 'p:any' }],
+  ];
+}
+
+function priceStepText(filters) {
+  const per = filters?.dealType === 'rent' ? ' в месяц' : '';
+  return `💰 Какая цена${per}?\n\nНажмите подходящий вариант (суммы в долларах $). Нужно что-то другое или в сумах — «✍️ Свой диапазон».`;
+}
+
+const PRICE_CUSTOM_TEXT =
+  '✍️ <b>Напишите цену обычным сообщением</b> (отвечать на это сообщение не нужно).\n\n' +
+  'Примеры:\n' +
+  '• <code>300-500$</code> — от 300 до 500 долларов\n' +
+  '• <code>до 800$</code> — не дороже 800 долларов\n' +
+  '• <code>от 1000$</code> — не дешевле 1000 долларов\n' +
+  '• <code>300-800 млн</code> — от 300 до 800 миллионов сум\n' +
+  '• <code>до 5 млрд</code> — до 5 миллиардов сум\n\n' +
+  '<i>$ — доллары, «млн»/«млрд»/«сум» — сумы. Если валюту не написать, числа до 100 000 считаю долларами.</i>';
+
+const AREA_STEP_TEXT = '📐 Какая площадь?\n\nНажмите подходящий вариант или «✍️ Свой диапазон».';
+
+const AREA_CUSTOM_TEXT =
+  '✍️ <b>Напишите площадь обычным сообщением</b> (отвечать на это сообщение не нужно).\n\n' +
+  'Примеры:\n' +
+  '• <code>50-100</code> — от 50 до 100 м²\n' +
+  '• <code>от 200</code> — от 200 м²\n' +
+  '• <code>до 80</code> — не больше 80 м²';
 
 function areaKeyboard() {
-  return [[{ text: '📐 Без ограничений по площади', callback_data: 'a:any' }]];
+  return [
+    ...presetRows([50, 100, 200, 500], ' м²', 'aa'),
+    [{ text: '✍️ Свой диапазон', callback_data: 'ac' }, { text: '📐 Не важно', callback_data: 'a:any' }],
+  ];
 }
+
 
 // Комнатность не применима к коммерции (офис/склад/магазин — это
 // площадь, а не комнаты, по просьбе Владика 24.08.2026), поэтому для
@@ -250,26 +277,18 @@ function threadExtra(threadId) {
   return threadId ? { message_thread_id: threadId } : {};
 }
 
-async function toggleFlaggedAgent(chatId, messageId, listingId, agentName) {
-  const readStartedAt = Date.now();
-  const { data: current, error: readError } = await supabase
-    .from('listings').select('flagged_agent, label_kind').eq('id', listingId).maybeSingle();
-  console.info(`[perf] db.toggleFlagged.read ${Date.now() - readStartedAt}ms${readError ? ' error' : ''}`);
-  throwOnSupabaseError('toggleFlaggedAgent.read', readError);
-  if (!current) throw new Error('Объявление не найдено для изменения метки');
-  const next = !current.flagged_agent;
-  const updateStartedAt = Date.now();
-  const { error: updateError } = await supabase
+async function toggleFlaggedAgent(chatId, messageId, listingId, agentName, callbackId) {
+  const { data: current } = await supabase.from('listings').select('flagged_agent').eq('id', listingId).maybeSingle();
+  const next = !current?.flagged_agent;
+  await supabase
     .from('listings')
     .update({
       flagged_agent: next,
       flagged_by: next ? agentName : null,
       flagged_at: next ? new Date().toISOString() : null,
-      label_kind: next ? 'agent' : current.label_kind,
+      label_kind: next ? 'agent' : current?.label_kind, // синхронизируем с label_kind, чтобы recheck-owners.js/delete-agent-messages.js тоже видели это как агента
     })
     .eq('id', listingId);
-  console.info(`[perf] db.toggleFlagged.update ${Date.now() - updateStartedAt}ms${updateError ? ' error' : ''}`);
-  throwOnSupabaseError('toggleFlaggedAgent.update', updateError);
 
   if (next) {
     // Раньше тут просто обновлялась карточка (бейдж "Похоже на
@@ -281,18 +300,20 @@ async function toggleFlaggedAgent(chatId, messageId, listingId, agentName) {
     // сообщение всё равно уже отправлено один раз в прошлом.
     const deleted = await deleteMessage(chatId, messageId);
     if (deleted) {
-      const { error: deletedError } = await supabase.from('listings').update({ telegram_deleted: true }).eq('id', listingId);
-      throwOnSupabaseError('toggleFlaggedAgent.markDeleted', deletedError);
+      await supabase.from('listings').update({ telegram_deleted: true }).eq('id', listingId);
+      await answerCallbackQuery(callbackId, '🚫 Отмечено как агентство — сообщение удалено');
       return;
     }
     // Не удалилось (например, сообщению больше 48 часов — Telegram
     // сам такое запрещает удалять ботам) — хотя бы обновляем карточку,
     // как раньше, чтобы было видно пометку.
     await refreshListingMessage(chatId, messageId, listingId);
+    await answerCallbackQuery(callbackId, '🚫 Отмечено как агентство (удалить сообщение не удалось — попробуйте вручную)');
     return;
   }
 
   await refreshListingMessage(chatId, messageId, listingId);
+  await answerCallbackQuery(callbackId, 'Пометка снята');
 }
 
 // Заметки не пишутся мастером/кнопками (Telegram не даёт открыть
@@ -312,12 +333,6 @@ async function promptForNote(chatId, cardMessageId, listingId, userId, threadId)
 }
 
 async function tryHandleNoteReply(message) {
-  // Большинство апдейтов (включая /start и обычные команды) не являются
-  // ответом на prompt заметки. Не ходим в Supabase за bot_sessions для
-  // каждого такого сообщения: это лишний сетевой round-trip перед
-  // обработкой даже самых простых команд.
-  if (!message.reply_to_message || !message.text || !message.from) return false;
-
   const chatId = message.chat.id;
   const userId = message.from.id;
   const session = await getSession(chatId, userId);
@@ -393,14 +408,7 @@ function listingPriceUzs(l) {
 // ---------- search ----------
 
 async function runSearch(filters) {
-  // Выбираем только поля, которые реально нужны поиску и карточкам.
-  // select('*') загружал десятки полей на каждое объявление, хотя сессия
-  // хранит максимум 100 результатов; это лишний трафик и JSON-парсинг.
-  let query = supabase
-    .from('listings')
-    .select('id, title, price, district, rooms, area, url, label_kind, created_at, price_value, price_currency, raw_text')
-    .order('created_at', { ascending: false })
-    .range(0, 999);
+  let query = supabase.from('listings').select('*').order('created_at', { ascending: false }).range(0, 999);
 
   // Агентства (label_kind='agent') не показываем — как и на сайте/в
   // push-уведомлениях, их снова полностью скрываем.
@@ -429,9 +437,7 @@ async function runSearch(filters) {
   const cutoff = new Date(Date.now() - SEARCH_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
   query = query.gte('created_at', cutoff);
 
-  const dbStartedAt = Date.now();
   const { data, error } = await query;
-  console.info(`[perf] db.runSearch ${Date.now() - dbStartedAt}ms rows=${data?.length ?? 0}${error ? ' error' : ''}`);
   if (error) {
     console.error('Ошибка поиска в Supabase:', error.message);
     return [];
@@ -526,8 +532,6 @@ async function startWizard(chatId, userId, existingMessageId, threadId) {
 
 async function handleCallback(update) {
   const cb = update.callback_query;
-  // Inline callbacks без message не поддерживаются этим мастером.
-  if (!cb?.message || !cb?.from?.id) return;
   const data = cb.data || '';
   const chatId = cb.message.chat.id;
   const userId = cb.from.id;
@@ -537,21 +541,36 @@ async function handleCallback(update) {
   // часть мастера поиска, обрабатываем сразу и выходим, до всей
   // остальной логики сессий ниже.
   if (data.startsWith('ct:')) {
-    await toggleContacted(chatId, messageId, data.slice(3), displayName(cb.from));
+    await toggleContacted(chatId, messageId, data.slice(3), displayName(cb.from), cb.id);
     return;
   }
   if (data.startsWith('as:')) {
-    await toggleAssigned(chatId, messageId, data.slice(3), displayName(cb.from));
+    await toggleAssigned(chatId, messageId, data.slice(3), displayName(cb.from), cb.id);
     return;
   }
   if (data.startsWith('fl:')) {
-    await toggleFlaggedAgent(chatId, messageId, data.slice(3), displayName(cb.from));
+    await toggleFlaggedAgent(chatId, messageId, data.slice(3), displayName(cb.from), cb.id);
     return;
   }
   if (data.startsWith('nt:')) {
     await promptForNote(chatId, messageId, data.slice(3), userId, cb.message.message_thread_id);
+    await answerCallbackQuery(cb.id);
     return;
   }
+
+  // Кнопки подсказок помощника (_chatHelper.js) и главное меню.
+  if (/^(hs|hn|hf|hx):/.test(data)) {
+    await handleHintCallback(cb, data);
+    return;
+  }
+  if (data.startsWith('mn:')) {
+    await handleMenuCallback(cb, data.slice(3));
+    return;
+  }
+
+  // synthetic — нажатие, которое бот «нажал сам» по тексту человека
+  // (см. pressButton ниже): у такого нажатия нет настоящего callback id.
+  if (!cb.synthetic) await answerCallbackQuery(cb.id);
 
   if (data === 'new') {
     await startWizard(chatId, userId, messageId);
@@ -603,10 +622,10 @@ async function handleCallback(update) {
     if (val === 'any') {
       filters.rooms = [];
       session.step = 'price';
-      await editMessageText(chatId, messageId, PRICE_STEP_TEXT, { reply_markup: { inline_keyboard: priceKeyboard() } });
+      await editMessageText(chatId, messageId, priceStepText(filters), { reply_markup: { inline_keyboard: priceKeyboard(filters) } });
     } else if (val === 'done') {
       session.step = 'price';
-      await editMessageText(chatId, messageId, PRICE_STEP_TEXT, { reply_markup: { inline_keyboard: priceKeyboard() } });
+      await editMessageText(chatId, messageId, priceStepText(filters), { reply_markup: { inline_keyboard: priceKeyboard(filters) } });
     } else {
       filters.rooms = filters.rooms || [];
       const idx = filters.rooms.indexOf(val);
@@ -616,12 +635,32 @@ async function handleCallback(update) {
         reply_markup: { inline_keyboard: roomsKeyboard(filters.rooms) },
       });
     }
+  } else if (data.startsWith('aa:')) {
+    const [lo, hi] = data.slice(3).split('-');
+    filters.areaRange = { min: lo ? Number(lo) : null, max: hi ? Number(hi) : null };
+    session.step = 'price';
+    await editMessageText(chatId, messageId, priceStepText(filters), { reply_markup: { inline_keyboard: priceKeyboard(filters) } });
+  } else if (data === 'ac') {
+    session.step = 'area';
+    await editMessageText(chatId, messageId, AREA_CUSTOM_TEXT, { reply_markup: { inline_keyboard: [[{ text: '⬅️ К вариантам', callback_data: 'ab' }]] } });
+  } else if (data === 'ab') {
+    await editMessageText(chatId, messageId, AREA_STEP_TEXT, { reply_markup: { inline_keyboard: areaKeyboard() } });
+  } else if (data === 'pc') {
+    session.step = 'price';
+    await editMessageText(chatId, messageId, PRICE_CUSTOM_TEXT, { reply_markup: { inline_keyboard: [[{ text: '⬅️ К вариантам', callback_data: 'pb' }]] } });
+  } else if (data === 'pb') {
+    await editMessageText(chatId, messageId, priceStepText(filters), { reply_markup: { inline_keyboard: priceKeyboard(filters) } });
   } else if (data === 'a:any') {
     filters.areaRange = null;
     session.step = 'price';
-    await editMessageText(chatId, messageId, PRICE_STEP_TEXT, { reply_markup: { inline_keyboard: priceKeyboard() } });
-  } else if (data === 'p:any') {
-    filters.priceRange = null;
+    await editMessageText(chatId, messageId, priceStepText(filters), { reply_markup: { inline_keyboard: priceKeyboard(filters) } });
+  } else if (data === 'p:any' || data.startsWith('pp:')) {
+    if (data === 'p:any') {
+      filters.priceRange = null;
+    } else {
+      const [lo, hi] = data.slice(3).split('-');
+      filters.priceRange = { min: lo ? Number(lo) : null, max: hi ? Number(hi) : null, currency: 'USD' };
+    }
     const results = await runSearch(filters);
     session.step = 'results';
     session.results = results;
@@ -656,17 +695,17 @@ function parseAreaRange(text) {
   return null;
 }
 
-async function handleAreaTextReply(message, loadedSession) {
+async function handleAreaTextReply(message) {
   const chatId = message.chat.id;
   const userId = message.from.id;
-  const session = loadedSession === undefined ? await getSession(chatId, userId) : loadedSession;
+  const session = await getSession(chatId, userId);
   if (!session || session.step !== 'area') return false;
 
   const parsed = parseAreaRange(message.text);
   if (!parsed) {
     await sendMessage(
       chatId,
-      '🤔 Не понял площадь. Попробуйте, например: <code>50-100</code> или <code>от 200</code>.',
+      '🤔 Не понял площадь. Напишите, например: <code>50-100</code>, <code>от 200</code> или <code>до 80</code> (в м²).',
       threadExtra(message.message_thread_id)
     );
     return true;
@@ -674,15 +713,15 @@ async function handleAreaTextReply(message, loadedSession) {
 
   session.filters.areaRange = parsed;
   session.step = 'price';
-  await editMessageText(chatId, session.menuMessageId, PRICE_STEP_TEXT, { reply_markup: { inline_keyboard: priceKeyboard() } });
+  await editMessageText(chatId, session.menuMessageId, priceStepText(session.filters), { reply_markup: { inline_keyboard: priceKeyboard(session.filters) } });
   await saveSession(chatId, userId, session);
   return true;
 }
 
-async function handlePriceTextReply(message, loadedSession) {
+async function handlePriceTextReply(message) {
   const chatId = message.chat.id;
   const userId = message.from.id;
-  const session = loadedSession === undefined ? await getSession(chatId, userId) : loadedSession;
+  const session = await getSession(chatId, userId);
   if (!session) return false;
 
   // Раньше это работало ТОЛЬКО сразу после шага "Диапазон цены?"
@@ -705,7 +744,7 @@ async function handlePriceTextReply(message, loadedSession) {
     if (!atPriceStep) return false;
     await sendMessage(
       chatId,
-      '🤔 Не понял диапазон. Попробуйте, например: <code>300-800 млн</code> или <code>от 500$</code>.',
+      '🤔 Не понял цену. Напишите, например: <code>300-500$</code>, <code>до 800$</code> или <code>300-800 млн</code> (сумы). Или вернитесь к кнопкам с вариантами — сообщение с шагом цены выше.',
       threadExtra(message.message_thread_id)
     );
     return true;
@@ -718,6 +757,11 @@ async function handlePriceTextReply(message, loadedSession) {
   session.offset = 0;
   await renderResultsPage(chatId, session.menuMessageId, session);
   await saveSession(chatId, userId, session);
+  if (!hasExplicitCurrency(message.text)) {
+    const unit = parsed.currency === 'USD' ? 'долларах ($)' : 'сумах';
+    const hint = parsed.currency === 'USD' ? 'Нужны сумы — допишите «млн», например <code>300-800 млн</code>.' : 'Нужны доллары — допишите «$», например <code>300-500$</code>.';
+    await sendMessage(chatId, `ℹ️ Валюту вы не указали — считаю цену в ${unit}. ${hint}`, threadExtra(message.message_thread_id));
+  }
   return true;
 }
 
@@ -862,6 +906,130 @@ async function handleClean(chatId, threadId) {
   }
 }
 
+// ---------- /help, /menu, /today + подсказки помощника ----------
+
+const LIST_FIELDS = 'id,title,price,district,rooms,area,url,label_kind,created_at,deal_type';
+
+function ownersFirst(list) {
+  const rank = { owner: 0, unchecked: 1, uncertain: 2, agent: 3 };
+  return [...list].sort((a, b) => {
+    const rd = (rank[a.label_kind] ?? 1) - (rank[b.label_kind] ?? 1);
+    return rd !== 0 ? rd : new Date(b.created_at) - new Date(a.created_at);
+  });
+}
+
+async function sendList(chatId, threadId, header, items, lineExtra) {
+  let text = header;
+  for (const l of items) {
+    const extra = lineExtra ? lineExtra(l) : '';
+    const piece = '\n\n' + listingLine(l) + (extra ? '\n' + extra : '');
+    if ((text + piece).length > 3900) break;
+    text += piece;
+  }
+  await sendMessage(chatId, text, {
+    reply_markup: { inline_keyboard: [[{ text: '🧭 Меню', callback_data: 'mn:menu' }]] },
+    ...threadExtra(threadId),
+  });
+}
+
+async function handleToday(chatId, threadId) {
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const { data, error } = await supabase
+    .from('listings')
+    .select(LIST_FIELDS)
+    .gte('created_at', since)
+    .neq('label_kind', 'agent')
+    .or('is_duplicate.is.null,is_duplicate.eq.false')
+    .order('created_at', { ascending: false })
+    .limit(300);
+  if (error) throw new Error(error.message);
+  if (!data?.length) {
+    await sendMessage(chatId, '🆕 За последние сутки новых объявлений не было.', threadExtra(threadId));
+    return;
+  }
+  const rent = data.filter((l) => l.deal_type === 'rent').length;
+  const sale = data.filter((l) => l.deal_type === 'sale').length;
+  const header = `🆕 <b>За сутки: ${data.length}</b> (аренда ${rent} · продажа ${sale})\n<i>Сверху собственники. Нужно уже — /find или /search.</i>`;
+  await sendList(chatId, threadId, header, ownersFirst(data).slice(0, 8));
+}
+
+async function sendHelp(chatId, threadId) {
+  await sendMessage(chatId, HELP_TEXT, { reply_markup: { inline_keyboard: menuKeyboard() }, ...threadExtra(threadId) });
+}
+
+async function handleMenuCallback(cb, action) {
+  const chatId = cb.message.chat.id;
+  const threadId = cb.message.message_thread_id;
+  await answerCallbackQuery(cb.id);
+  if (action === 'find') await startWizard(chatId, cb.from.id, null, threadId);
+  else if (action === 'ai')
+    await sendMessage(
+      chatId,
+      '💬 Напишите после <code>/search</code>, что ищете, например:\n<code>/search 2-комнатная в Чиланзаре до 600$, от собственника</code>',
+      threadExtra(threadId)
+    );
+  else if (action === 'today') await handleToday(chatId, threadId);
+  else if (action === 'menu')
+    await sendMessage(chatId, '🧭 Что делаем?', { reply_markup: { inline_keyboard: menuKeyboard() }, ...threadExtra(threadId) });
+  else await sendHelp(chatId, threadId);
+}
+
+// Кнопки подсказок: hs: искать, hn: заметка, hf: пометить агентом, hx: закрыть.
+// Нажать может только тот, кому адресована подсказка — иначе чужой клик
+// сохранил бы заметку/пометку от чужого имени.
+async function handleHintCallback(cb, data) {
+  const chatId = cb.message.chat.id;
+  const messageId = cb.message.message_id;
+  const [action, rawId] = [data.slice(0, 2), data.slice(3)];
+  const hint = await getHint(Number(rawId));
+  if (!hint) {
+    await answerCallbackQuery(cb.id, 'Подсказка устарела');
+    await deleteMessage(chatId, messageId);
+    return;
+  }
+  if (String(hint.user_id) !== String(cb.from.id)) {
+    await answerCallbackQuery(cb.id, 'Эта подсказка для другого участника');
+    return;
+  }
+  const threadId = cb.message.message_thread_id;
+  if (action === 'hx') {
+    await answerCallbackQuery(cb.id);
+    await deleteMessage(chatId, messageId);
+    return;
+  }
+  if (action === 'hs') {
+    await answerCallbackQuery(cb.id, '🔎 Ищу…');
+    await deleteMessage(chatId, messageId);
+    await handleAiSearch(chatId, cb.from.id, hint.payload.query, threadId);
+    return;
+  }
+  if (action === 'hn') {
+    await supabase.from('listings').update({ notes: String(hint.payload.text || '').slice(0, 500) }).eq('id', hint.payload.listingId);
+    await refreshListingMessage(chatId, hint.payload.cardMessageId, hint.payload.listingId);
+    await answerCallbackQuery(cb.id, '📝 Заметка сохранена');
+    await deleteMessage(chatId, messageId);
+    return;
+  }
+  if (action === 'hf') {
+    await deleteMessage(chatId, messageId);
+    await toggleFlaggedAgent(chatId, hint.payload.cardMessageId, hint.payload.listingId, displayName(cb.from), cb.id);
+  }
+}
+
+// «Нажимает» кнопку мастера от имени человека, который вместо кнопки написал
+// текст (например «Чиланзар»). Используется _chatHelper.js.
+function pressButton(message, session, data) {
+  return handleCallback({
+    callback_query: {
+      id: 'synthetic',
+      synthetic: true,
+      data,
+      from: message.from,
+      message: { chat: message.chat, message_id: session.menuMessageId, message_thread_id: message.message_thread_id },
+    },
+  });
+}
+
 async function handleMessage(message) {
   if (await tryHandleNoteReply(message)) return;
 
@@ -889,19 +1057,20 @@ async function handleMessage(message) {
     await handleAiSearch(message.chat.id, message.from.id, queryText, threadId);
     return;
   }
+  if (cmd === '/help' || cmd === '/помощь') {
+    await sendHelp(message.chat.id, threadId);
+    return;
+  }
+  if (cmd === '/menu' || cmd === '/меню') {
+    await sendMessage(message.chat.id, '🧭 Что делаем?', { reply_markup: { inline_keyboard: menuKeyboard() }, ...threadExtra(threadId) });
+    return;
+  }
+  if (cmd === '/today') {
+    await handleToday(message.chat.id, threadId);
+    return;
+  }
   if (cmd === '/start') {
-    // /start — просто приветствие с подсказкой по обеим командам, а не
-    // сразу мастер: человек может добавить бота в группу и написать
-    // /start случайно/не глядя — сразу вываливать пошаговый мастер
-    // было бы навязчиво. Сам мастер — по явной команде /find (или
-    // /filter/фильтр), см. ниже.
-    await sendMessage(
-      message.chat.id,
-      '👋 Привет! Два способа искать:\n\n' +
-        '🔍 <code>/find</code> — пошаговый фильтр кнопками (тип сделки, район, комнаты, цена)\n' +
-        '💬 <code>/search текст</code> — опишите словами, например:\n<code>/search 3-комнатная в Юнусабаде до 80000$, только от собственника</code>',
-      threadExtra(threadId)
-    );
+    await sendHelp(message.chat.id, threadId);
     return;
   }
   if (cmd === '/find' || cmd === '/filter' || cmd === '/фильтр') {
@@ -918,72 +1087,21 @@ async function handleMessage(message) {
     return;
   }
   if (message.text && !cmd) {
-    // Загружаем сессию один раз: раньше обычный текст мог вызвать два
-    // последовательных SELECT (area, затем price) даже когда шаг не совпадал.
-    const session = await getSession(message.chat.id, message.from.id);
-    if (await handleAreaTextReply(message, session)) return;
-    await handlePriceTextReply(message, session);
-  }
-}
-
-// ---------- entrypoint ----------
-
-export default async function handler(req, res) {
-  const requestStartedAt = Date.now();
-  if (req.method !== 'POST') {
-    res.status(405).json({ error: 'method not allowed' });
-    return;
+    if (await handleAreaTextReply(message)) return;
+    if (await handlePriceTextReply(message)) return;
   }
 
-  const got = req.headers['x-telegram-bot-api-secret-token'];
-  if (!WEBHOOK_SECRET || got !== WEBHOOK_SECRET) {
-    res.status(401).json({ error: 'bad secret token' });
-    return;
-  }
-
-  const update = req.body;
-  if (isDuplicateUpdate(update?.update_id)) {
-    console.info('[perf] webhook duplicate update skipped');
-    res.status(200).json({ ok: true, duplicate: true });
-    return;
-  }
-
+  // Помощник по чату: читает обычные сообщения и подсказывает, если человек
+  // застрял (см. _chatHelper.js). Любая ошибка тут не должна ломать основной
+  // поток и не должна показывать пользователю «что-то пошло не так».
   try {
-    if (update?.callback_query) {
-      // Telegram requires a callback acknowledgement quickly. Do this before
-      // any Supabase reads, edits, or business logic, and exactly once.
-      const callbackId = update.callback_query.id;
-      try {
-        await answerCallbackQuery(callbackId);
-      } catch (ackError) {
-        console.error('[telegram] callback acknowledgement transport failure:', ackError.message);
-      }
-      const callbackStartedAt = Date.now();
-      await handleCallback(update);
-      console.info(`[perf] business.callback ${Date.now() - callbackStartedAt}ms`);
-    } else if (update?.message) {
-      const messageStartedAt = Date.now();
-      await handleMessage(update.message);
-      console.info(`[perf] business.message ${Date.now() - messageStartedAt}ms`);
-    }
+    const session = message.text ? await getSession(message.chat.id, message.from.id) : null;
+    await runChatHelper(message, {
+      cmd,
+      session,
+      deps: { sendMessage, threadExtra, runAiSearch: handleAiSearch, pressButton },
+    });
   } catch (err) {
-    console.error('Ошибка обработки Telegram-апдейта:', err);
-    const chatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id;
-    const threadId = update?.message?.message_thread_id ?? update?.callback_query?.message?.message_thread_id;
-    if (chatId) {
-      try {
-        await sendMessage(
-          chatId,
-          '⚠️ Что-то пошло не так при обработке запроса. Попробуйте ещё раз или начните заново: /find',
-          threadExtra(threadId)
-        );
-      } catch (sendErr) {
-        console.error('Не удалось отправить сообщение об ошибке:', sendErr.message);
-      }
-    }
-  } finally {
-    console.info(`[perf] webhook ${Date.now() - requestStartedAt}ms type=${update?.callback_query ? 'callback' : update?.message ? 'message' : 'other'}`);
+    console.error('Ошибка помощника по чату:', err);
   }
-
-  res.status(200).json({ ok: true });
 }
