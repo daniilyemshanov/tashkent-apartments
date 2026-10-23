@@ -38,6 +38,36 @@ import { runChatHelper, getHint, HELP_TEXT, menuKeyboard } from './_chatHelper.j
 import { isDuplicateUpdate } from './_updateDedupe.js';
 
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
+
+// ПРИВАТНЫЙ БОТ: отвечает только в чатах, которые заданы в проекте (chat id). Остальные
+// группы, личка и чужие кнопки молча игнорируются.
+// Разрешены: чаты проекта ниже (группы квартир/аренды/коммерции/домов/сделок из
+// scraper/.env + рабочий чат) и ВСЕ чаты из переменных окружения Vercel вида
+// TELEGRAM_CHAT_ID, TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_GROUP_* и TELEGRAM_ALLOWED_CHAT_IDS
+// (через запятую) — добавили новую группу в проект, и она разрешена автоматически.
+const PROJECT_CHAT_IDS = [
+  '-1004439617987', // квартиры (TELEGRAM_CHAT_ID / TELEGRAM_GROUP_APARTMENT)
+  '-1004495565046', // аренда квартир
+  '-1004379703911', // коммерция
+  '-1003922554961', // аренда коммерции
+  '-1004407786966', // дома
+  '-1004400606220', // сделки
+  '-5316553360', // рабочий чат
+];
+
+function collectAllowedChatIds() {
+  const ids = new Set(PROJECT_CHAT_IDS.map(Number));
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^TELEGRAM_(CHAT_ID|ADMIN_CHAT_ID|ALLOWED_CHAT_IDS|GROUP_[A-Z_]+)$/.test(key)) continue;
+    for (const part of String(value || '').split(',')) {
+      const n = Number(part.trim());
+      if (part.trim() && Number.isFinite(n)) ids.add(n);
+    }
+  }
+  return ids;
+}
+const ALLOWED_CHAT_IDS = collectAllowedChatIds();
+
 const EXCHANGE_RATE_USD_UZS = Number(process.env.EXCHANGE_RATE_USD_UZS) || 11990;
 const RESULTS_PAGE_SIZE = 5;
 const SEARCH_WINDOW_DAYS = 14; // не тащим совсем старые объявления в поиск
@@ -1124,6 +1154,13 @@ export default async function handler(req, res) {
   }
 
   const update = req.body;
+  // Чат берём из сообщения или из сообщения, под которым нажали кнопку.
+  const updateChatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id;
+  if (!ALLOWED_CHAT_IDS.has(Number(updateChatId))) {
+    console.warn('[private] апдейт из неразрешённого чата проигнорирован:', updateChatId);
+    res.status(200).json({ ok: true, ignored: true });
+    return;
+  }
   if (isDuplicateUpdate(update?.update_id)) {
     res.status(200).json({ ok: true, duplicate: true });
     return;
