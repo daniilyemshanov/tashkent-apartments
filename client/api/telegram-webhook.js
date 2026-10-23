@@ -904,6 +904,30 @@ async function handleAiSearch(chatId, userId, queryText, threadId) {
 // не трогает bot_sessions.step у мастера и наоборот.
 const FIND_WIZARD_ENABLED = true;
 
+// Кому адресована команда: "/help@tashkent_apartments_bot" → "tashkent_apartments_bot".
+// Без @имени (null) команда считается адресованной всем ботам в чате.
+function commandTarget(message) {
+  const entity = (message.entities || []).find((e) => e.type === 'bot_command' && e.offset === 0);
+  if (!entity) return null;
+  const target = message.text.slice(0, entity.length).split('@')[1];
+  return target ? target.toLowerCase() : null;
+}
+
+// Собственный @username бота: из TELEGRAM_BOT_USERNAME или один раз через getMe (кэш
+// на время жизни функции). Если определить не удалось — null, и бот отвечает как раньше.
+let ownUsernameCache = (process.env.TELEGRAM_BOT_USERNAME || '').replace(/^@/, '').trim().toLowerCase();
+async function getOwnUsername() {
+  if (ownUsernameCache) return ownUsernameCache;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${(process.env.TELEGRAM_BOT_TOKEN || '').trim()}/getMe`);
+    const json = await res.json();
+    ownUsernameCache = (json?.result?.username || '').toLowerCase();
+  } catch (err) {
+    console.warn('getMe не удался:', err.message);
+  }
+  return ownUsernameCache;
+}
+
 function commandName(message) {
   const entity = (message.entities || []).find((e) => e.type === 'bot_command' && e.offset === 0);
   if (!entity) return null;
@@ -1062,6 +1086,13 @@ function pressButton(message, session, data) {
 }
 
 async function handleMessage(message) {
+  // Команда адресована ДРУГОМУ боту ("/help@ChatAutopostttBot") — молчим целиком,
+  // даже базу не трогаем: пусть отвечает тот бот, которому она адресована.
+  const addressedTo = commandTarget(message);
+  if (addressedTo) {
+    const own = await getOwnUsername();
+    if (own && addressedTo !== own) return;
+  }
   if (await tryHandleNoteReply(message)) return;
 
   // message_thread_id есть только в супергруппах с включёнными темами
