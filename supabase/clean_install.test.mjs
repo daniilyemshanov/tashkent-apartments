@@ -24,11 +24,10 @@ test('clean installer contains all previously missing listing fields and market 
   assert.match(sql, /create table if not exists public\.market_stats_manual/);
 });
 
-test('scraper market-stat imports have matching database exports', () => {
-  for (const name of ['getStatsSourceListings', 'upsertMarketStats', 'getAllMarketStats', 'getAllMarketStatsManual']) {
+test('scraper db.js exports every helper the scraper imports', () => {
+  for (const name of ['getListingById', 'getListingsLiteByIds', 'saveListing', 'markNotified', 'getTopicId', 'getTopicIdStrict', 'saveTopicId']) {
     assert.match(dbSource, new RegExp(`export async function ${name}\\b`));
   }
-  assert.match(dbSource, /\.from\('market_stats_manual'\)/);
 });
 
 test('Telegram webhook RPC exists and is restricted to service_role', () => {

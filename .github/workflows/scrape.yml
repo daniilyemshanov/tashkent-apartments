@@ -5,7 +5,12 @@ on:
   # (иногда на часы вместо минут, это известная проблема GitHub Actions
   # в 2026 году, не наш баг). Вместо него запуск дёргает внешний
   # cron-сервис (cron-job.org) через API, см. README.
-  workflow_dispatch: {} # позволяет запустить вручную кнопкой в GitHub, и именно этот же триггер дёргает внешний cron-сервис
+  workflow_dispatch: # позволяет запустить вручную кнопкой в GitHub, и именно этот же триггер дёргает внешний cron-сервис
+    inputs:
+      force:
+        description: "Запустить, даже если сейчас ночной режим (реже ночью)"
+        type: boolean
+        default: false
 
 # Инцидент 19.08.2026: один прогон завис на источнике, который начал
 # блокировать буквально каждый запрос (см. circuit breaker в
@@ -74,16 +79,47 @@ jobs:
       run:
         working-directory: scraper
     steps:
+      # Ночной режим: ночью новых объявлений почти нет, а каждый прогон
+      # стоит запросов к базе и минут Actions. Пока по Ташкенту (UTC+5) час
+      # попадает в [NIGHT_START_HOUR, NIGHT_END_HOUR), из каждых
+      # NIGHT_INTERVAL_MIN минут отрабатывает только один тик внешнего
+      # cron-а (остальные завершаются за секунды, не ставя зависимости и не
+      # трогая базу). Настраивается переменными репозитория (Settings →
+      # Secrets and variables → Actions → Variables): NIGHT_INTERVAL_MIN
+      # (по умолчанию 60; 15 или меньше — ночной режим выключен),
+      # NIGHT_START_HOUR (0), NIGHT_END_HOUR (7). Ручной запуск с
+      # галочкой force пропускает эту проверку.
+      - name: Ночной режим (реже ночью)
+        id: gate
+        env:
+          FORCE: ${{ inputs.force }}
+          INTERVAL: ${{ vars.NIGHT_INTERVAL_MIN || 60 }}
+          START_H: ${{ vars.NIGHT_START_HOUR || 0 }}
+          END_H: ${{ vars.NIGHT_END_HOUR || 7 }}
+        run: |
+          H=$((10#$(TZ=Asia/Tashkent date +%H)))
+          M=$((10#$(TZ=Asia/Tashkent date +%M)))
+          skip=false
+          if [ "$FORCE" != "true" ] && [ "$INTERVAL" -gt 15 ] && [ "$H" -ge "$START_H" ] && [ "$H" -lt "$END_H" ]; then
+            if [ $(( (H * 60 + M) % INTERVAL )) -ge 15 ]; then skip=true; fi
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "Ташкент $H:$M, интервал ночью ${INTERVAL} мин, пропуск: $skip"
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.skip != 'true'
 
       - uses: actions/setup-node@v4
+        if: steps.gate.outputs.skip != 'true'
         with:
           node-version: "22"
 
       - name: Установка зависимостей
+        if: steps.gate.outputs.skip != 'true'
         run: npm install
 
       - name: Запуск проверки (${{ matrix.deal_type }})
+        if: steps.gate.outputs.skip != 'true'
         run: node src/run.js
         env:
           # Ограничивает main() в run.js только этим типом сделки —

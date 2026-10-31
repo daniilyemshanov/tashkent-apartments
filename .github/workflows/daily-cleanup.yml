@@ -1,0 +1,49 @@
+name: Daily cleanup
+
+# Раз в сутки чистит базу Supabase (supabase/18_storage_diet.sql) и следит за
+# её размером. Перед первым запуском выполните supabase/18_storage_diet.sql
+# в Supabase SQL Editor.
+#
+# По умолчанию работает в ПРОБНОМ режиме: только считает и пишет в лог, что
+# было бы очищено, ничего не удаляя. Реальная очистка включается переменной
+# репозитория DAILY_CLEANUP_LIVE=true (Settings → Secrets and variables →
+# Actions → Variables). Необязательные переменные (числа):
+#   KEEP_DAYS (14)        — сколько дней хранить обычные объявления
+#   KEEP_AGENT_DAYS (30)  — сколько дней хранить агентские (по ним ловим
+#                           повторяющиеся телефоны)
+#   TEXT_DAYS (7)         — через сколько дней стирать полный текст
+#   DB_SIZE_ALERT_MB (350) — порог предупреждения в Telegram
+on:
+  schedule:
+    # 02:41 по Ташкенту (UTC+5), в стороне от запусков скрапера.
+    - cron: '41 21 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Clean listings and check database size
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+          DAILY_CLEANUP_LIVE: ${{ vars.DAILY_CLEANUP_LIVE }}
+          KEEP_DAYS: ${{ vars.KEEP_DAYS }}
+          KEEP_AGENT_DAYS: ${{ vars.KEEP_AGENT_DAYS }}
+          TEXT_DAYS: ${{ vars.TEXT_DAYS }}
+          DB_SIZE_ALERT_MB: ${{ vars.DB_SIZE_ALERT_MB }}
+        run: node .github/scripts/daily-cleanup.mjs

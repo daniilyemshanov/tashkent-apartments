@@ -15,7 +15,7 @@
 import 'dotenv/config';
 import axios from 'axios';
 import { DISTRICTS } from '../districts.js';
-import { saveTopicId, getTopicId } from '../db.js';
+import { saveTopicId, getTopicIdStrict } from '../db.js';
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 
@@ -58,14 +58,27 @@ async function main() {
     console.log(`\n📁 ${GROUP_LABELS[groupKey]} (${chatId})`);
 
     for (const { canonical } of DISTRICTS) {
-      const existing = await getTopicId(groupKey, canonical);
+      // Строгая версия: если база недоступна — останавливаемся, а не
+      // считаем, что темы нет. Иначе при сбое Supabase скрипт создавал
+      // бы в Telegram дубли уже существующих тем.
+      let existing;
+      try {
+        existing = await getTopicIdStrict(groupKey, canonical);
+      } catch (err) {
+        console.error(`\n⛔ База недоступна (${err.message}). Останавливаюсь, чтобы не плодить дубли тем. Починить Supabase и запустить снова.`);
+        process.exit(1);
+      }
       if (existing) {
         console.log(`  ✓ "${canonical}" уже есть (тема #${existing})`);
         continue;
       }
       try {
         const threadId = await createTopic(chatId, canonical);
-        await saveTopicId(groupKey, canonical, threadId);
+        const saved = await saveTopicId(groupKey, canonical, threadId);
+        if (!saved) {
+          console.error(`\n⛔ Тема "${canonical}" создана в Telegram (#${threadId}), но не записана в базу. Останавливаюсь, чтобы не плодить дубли. Запишите её вручную: group_key=${groupKey}, district=${canonical}, message_thread_id=${threadId}.`);
+          process.exit(1);
+        }
         console.log(`  + "${canonical}" создана (тема #${threadId})`);
       } catch (err) {
         console.error(`  ✗ "${canonical}" не удалось создать:`, err.response?.data || err.message);

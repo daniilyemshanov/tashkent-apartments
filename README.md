@@ -201,7 +201,7 @@ The system can also send administrative alerts to a separate private chat.
 Topic structure can be automatically created using:
 
 ```text
-scraper/src/setup-topics.js
+scraper/src/scripts/setup-topics.js
 ```
 
 ---
@@ -271,7 +271,7 @@ scraper/
 │   ├── extractListingInfo.js
 │   ├── listingScoring.js
 │   ├── run.js
-│   └── setup-topics.js
+│   └── scripts/   (разовые утилиты, в т.ч. setup-topics.js)
 └── .env.example
 
 supabase/

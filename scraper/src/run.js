@@ -13,6 +13,7 @@ import { classifyListing, labelFor, SELLER_LISTINGS_AGENT_THRESHOLD } from './cl
 import { notifyAlert, notifyToTopicGroup } from './telegram.js';
 import {
   getListingById,
+  getListingsLiteByIds,
   getLatestListingByEntityKey,
   saveListing,
   markNotified,
@@ -64,6 +65,11 @@ const LLM_EXTRACT_DELAY_MS = Number(process.env.LLM_EXTRACT_DELAY_MS) || 500;
 // новое объявление), задайте USE_AI_EXTRACTION=true и добавьте
 // ANTHROPIC_API_KEY в окружение скрапера (см. scrape.yml).
 const USE_AI_EXTRACTION = process.env.USE_AI_EXTRACTION === 'true';
+
+// Полный текст объявления — самое тяжёлое поле в базе. Агентским он не
+// нужен вообще (их не показываем ни в Telegram, ни на сайте; для дедупа
+// хватает entity_key и телефона), остальным режем по длине.
+const RAW_TEXT_MAX_CHARS = 3000;
 
 const PHONE_REGEX = /(\+?998[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2})/;
 const REALTING_ENABLED = process.env.REALTING_ENABLED !== 'false';
@@ -175,19 +181,33 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
   let consecutiveDetailFailures = 0;
   let circuitBreakerTripped = false;
 
+  // Один запрос на всю пачку вместо отдельного на каждое объявление: из базы
+  // берём только поля, нужные, чтобы понять "уже известно и не менялось".
+  // Полную запись (getListingById) читаем лишь для тех, кого реально
+  // обрабатываем. При сбое базы (null) откатываемся на старое поведение.
+  const liteById = await getListingsLiteByIds(items.map((i) => i.id));
+
   for (const item of items) {
     if (circuitBreakerTripped) break;
-    const existingById = await getListingById(item.id);
     const listPrice = parsePrice(item.price);
-    const hasBackfilledScoring =
-      existingById?.owner_score != null && existingById?.price_history_count != null;
-    const sameKnownPrice =
-      existingById &&
-      existingById.price_value != null &&
+    const isUnchangedKnown = (row) =>
+      row &&
+      row.owner_score != null &&
+      row.price_history_count != null &&
+      row.price_value != null &&
       listPrice.value != null &&
-      Number(existingById.price_value) === Number(listPrice.value) &&
-      String(existingById.price_currency || '').toUpperCase() === String(listPrice.currency || '').toUpperCase();
-    if (existingById && sameKnownPrice && hasBackfilledScoring) continue;
+      Number(row.price_value) === Number(listPrice.value) &&
+      String(row.price_currency || '').toUpperCase() === String(listPrice.currency || '').toUpperCase();
+
+    let existingById;
+    if (liteById) {
+      const lite = liteById.get(item.id);
+      if (isUnchangedKnown(lite)) continue;
+      existingById = lite ? await getListingById(item.id) : null;
+    } else {
+      existingById = await getListingById(item.id);
+      if (isUnchangedKnown(existingById)) continue;
+    }
 
     let rawText = item.title;
     let sellerName = null;
@@ -419,7 +439,7 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
 
     if (!isConfirmedAgent && !isConfirmedOwner && sellerCheckUnavailable) {
       // Пропускаем ВЕСЬ этот прогон для объявления — не сохраняем и не
-      // отправляем. isKnown() на следующем прогоне (через 15 минут)
+      // отправляем. проверка известных на следующем прогоне (через 15 минут)
       // снова увидит его как новое и попробует проверить продавца с
       // нуля. Пока OLX блокирует запросы (403), это означает, что
       // объявления с этого источника вообще перестанут приходить в
@@ -523,7 +543,7 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
     // если LLM недоступна (см. extractListingInfo.js). Пауза после
     // вызова — чтобы не упереться в лимит бесплатного тира Gemini на
     // пачке новых объявлений за один прогон (сюда доходят только
-    // новые — см. `if (await isKnown(item.id)) continue` в начале
+    // новые — см. пропуск неизменившихся известных объявлений в начале
     // цикла).
     // Агентские объявления (isConfirmedAgent) НЕ отправляются ни в
     // Telegram, ни на сайт по умолчанию (см. notifyToTopicGroup ниже и
@@ -673,7 +693,7 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
     const listing = {
       ...item,
       published_at: parsePublishedAt(item.posted_raw) ?? existingById?.published_at ?? null,
-      raw_text: rawText,
+      raw_text: isConfirmedAgent ? null : rawText.slice(0, RAW_TEXT_MAX_CHARS),
       seller_name: sellerName,
       seller_listings_count: sellerListingsCount,
       district,
@@ -723,7 +743,7 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
     if (!saved) {
       // Не сохранилось в базу — не шлём уведомление вообще (иначе
       // получим дубль на следующем прогоне, см. комментарий в db.js).
-      // Просто пропускаем — при следующем запуске isKnown() снова
+      // Просто пропускаем — при следующем запуске объявление снова
       // увидит его как "новое" и попробует сохранить+отправить с нуля.
       console.error(`[${sourceLabel}] пропускаю уведомление — не удалось сохранить в базу: ${listing.title}`);
       continue;

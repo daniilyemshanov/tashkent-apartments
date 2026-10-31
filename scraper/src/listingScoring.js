@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { toUsd } from './priceParser.js';
 
+const PRICE_HISTORY_MAX = 30;
 const DEFAULT_SIGNIFICANT_PRICE_CHANGE_PCT = Number(process.env.DEAL_SCORE_SIGNIFICANT_PRICE_CHANGE_PCT) || 7;
 const DEFAULT_DUPLICATE_PRICE_CHANGE_PCT = Number(process.env.DUPLICATE_PRICE_CHANGE_THRESHOLD_PCT) || 5;
 
@@ -98,6 +99,11 @@ export function summarizePriceHistory(previousHistory, currentObservation, excha
   if (!sameAsLast) {
     history.push(normalizedCurrent);
   }
+  // История цен не должна расти бесконечно (каждая запись — лишние байты
+  // в базе на каждом объявлении). Хранится только хвост последних
+  // PRICE_HISTORY_MAX наблюдений; счётчики изменений при этом упираются
+  // в тот же потолок, что для реальных объявлений недостижимо.
+  if (history.length > PRICE_HISTORY_MAX) history.splice(0, history.length - PRICE_HISTORY_MAX);
 
   const observations = history
     .map((entry) => ({

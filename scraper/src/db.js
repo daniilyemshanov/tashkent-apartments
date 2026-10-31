@@ -14,13 +14,29 @@ const supabase = createClient(
   }
 );
 
-export async function isKnown(id) {
-  const { data, error } = await supabase.from('listings').select('id').eq('id', id).maybeSingle();
-  if (error) {
-    console.error('Supabase (isKnown) ошибка:', error.message);
-    return false; // при сбое лучше перепроверить объявление ещё раз, чем потерять его
+/**
+ * Один запрос на всю пачку id вместо отдельного запроса на каждое
+ * объявление: достаёт только те 5 полей, которые нужны, чтобы решить
+ * "это объявление уже известно и не менялось — пропускаем".
+ * @returns {Promise<Map<string, object>|null>} null при ошибке базы —
+ *   тогда вызывающий код откатывается на getListingById по одному.
+ */
+export async function getListingsLiteByIds(ids) {
+  const unique = [...new Set((ids || []).filter(Boolean))];
+  const map = new Map();
+  for (let i = 0; i < unique.length; i += 100) {
+    const chunk = unique.slice(i, i + 100);
+    const { data, error } = await supabase
+      .from('listings')
+      .select('id, price_value, price_currency, owner_score, price_history_count')
+      .in('id', chunk);
+    if (error) {
+      console.error('Supabase (getListingsLiteByIds) ошибка:', error.message);
+      return null;
+    }
+    for (const row of data || []) map.set(row.id, row);
   }
-  return !!data;
+  return map;
 }
 
 /**
@@ -32,7 +48,7 @@ export async function getListingById(id) {
   const { data, error } = await supabase
     .from('listings')
     .select(
-      'id, url, title, price, price_value, price_currency, price_per_sqm, raw_text, district, rooms, area, phone, phone_normalized, seller_name, seller_type, confidence, label_kind, label_text, seller_listings_count, market_segment, owner_score, is_duplicate, duplicate_of_id, duplicate_reason, entity_key, price_history, price_history_count, price_drop_count, price_change_count, last_price_change_pct, last_price_change_at, first_seen_price_value, last_seen_price_value, published_at, notified, created_at'
+      'id, url, title, price, price_value, price_currency, price_per_sqm, district, rooms, area, phone, phone_normalized, seller_name, seller_type, confidence, label_kind, label_text, seller_listings_count, market_segment, owner_score, is_duplicate, duplicate_of_id, duplicate_reason, entity_key, price_history, price_history_count, price_drop_count, price_change_count, last_price_change_pct, last_price_change_at, first_seen_price_value, last_seen_price_value, published_at, notified, created_at'
     )
     .eq('id', id)
     .maybeSingle();
@@ -174,24 +190,46 @@ export async function countListingsByPhone(phoneNormalized, excludeId) {
   return count || 0;
 }
 
+// Темы по районам почти не меняются (максимум ~6 групп × 13 районов = ~80
+// строк), поэтому читаем всю таблицу ОДИН раз за процесс и дальше берём из
+// памяти, вместо отдельного запроса на каждое объявление.
+let topicCache = null; // Map<"group|district", threadId>
+
+async function loadTopicCache() {
+  const { data, error } = await supabase
+    .from('forum_topics')
+    .select('group_key, district, message_thread_id');
+  if (error) throw new Error(error.message);
+  topicCache = new Map((data || []).map((r) => [`${r.group_key}|${r.district}`, r.message_thread_id]));
+  return topicCache;
+}
+
 /**
  * Возвращает message_thread_id темы для пары (groupKey, district),
- * или null, если такой темы ещё нет (тогда сообщение уйдёт в общую
- * тему группы без привязки к теме).
+ * или null, если такой темы ещё нет ИЛИ база недоступна (тогда сообщение
+ * уйдёт в общую тему группы). Для скриптов, которым важно отличать
+ * "темы нет" от "база упала" — см. getTopicIdStrict.
  */
 export async function getTopicId(groupKey, district) {
   if (!district) return null;
-  const { data, error } = await supabase
-    .from('forum_topics')
-    .select('message_thread_id')
-    .eq('group_key', groupKey)
-    .eq('district', district)
-    .maybeSingle();
-  if (error) {
-    console.error('Supabase (getTopicId) ошибка:', error.message);
+  try {
+    const cache = topicCache || (await loadTopicCache());
+    return cache.get(`${groupKey}|${district}`) ?? null;
+  } catch (err) {
+    console.error('Supabase (getTopicId) ошибка:', err.message);
     return null;
   }
-  return data?.message_thread_id ?? null;
+}
+
+/**
+ * То же, что getTopicId, но при ошибке базы БРОСАЕТ исключение, а не
+ * возвращает null. Нужно setup-topics.js: иначе при недоступной базе
+ * скрипт считал, что темы нет, и создавал в Telegram дубли.
+ * Всегда читает из базы заново (кэш не используется).
+ */
+export async function getTopicIdStrict(groupKey, district) {
+  const cache = await loadTopicCache();
+  return cache.get(`${groupKey}|${district}`) ?? null;
 }
 
 /**
@@ -204,67 +242,8 @@ export async function saveTopicId(groupKey, district, messageThreadId) {
     .upsert({ group_key: groupKey, district, message_thread_id: messageThreadId }, { onConflict: 'group_key,district' });
   if (error) {
     console.error('Supabase (saveTopicId) ошибка:', error.message);
-  }
-}
-
-
-// Market statistics persistence used by scraper/src/marketStats.js.
-// Keep these calls bounded and paginate source listings so the PostgREST
-// default row cap cannot silently skew the computed medians.
-export async function getStatsSourceListings(lookbackDays = 45) {
-  const days = Number.isFinite(Number(lookbackDays)) && Number(lookbackDays) > 0 ? Number(lookbackDays) : 45;
-  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  const pageSize = 1000;
-  const rows = [];
-
-  for (let from = 0; ; from += pageSize) {
-    const { data, error } = await supabase
-      .from('listings')
-      .select('id, created_at, property_type, deal_type, district, price_per_sqm, price_currency, market_segment')
-      .gte('created_at', cutoff)
-      .not('price_per_sqm', 'is', null)
-      .in('label_kind', ['owner', 'unchecked'])
-      .or('is_duplicate.is.null,is_duplicate.eq.false')
-      .order('created_at', { ascending: true })
-      .order('id', { ascending: true })
-      .range(from, from + pageSize - 1);
-    if (error) {
-      console.error('Supabase (getStatsSourceListings) ошибка:', error.message);
-      return [];
-    }
-    rows.push(...(data || []));
-    if (!data || data.length < pageSize) return rows;
-  }
-}
-
-export async function upsertMarketStats(rows) {
-  if (!Array.isArray(rows) || rows.length === 0) return true;
-  const { error } = await supabase.from('market_stats').upsert(rows, { onConflict: 'group_key' });
-  if (error) {
-    console.error('Supabase (upsertMarketStats) ошибка:', error.message);
     return false;
   }
+  if (topicCache) topicCache.set(`${groupKey}|${district}`, messageThreadId);
   return true;
-}
-
-export async function getAllMarketStats() {
-  const { data, error } = await supabase
-    .from('market_stats')
-    .select('group_key, median_price_per_sqm, sample_size');
-  if (error) {
-    console.error('Supabase (getAllMarketStats) ошибка:', error.message);
-    return [];
-  }
-  return data || [];
-}
-
-export async function getAllMarketStatsManual() {
-  const { data, error } = await supabase
-    .from('market_stats_manual')
-    .select('group_key, median_price_per_sqm');
-  if (error) {
-    console.error('Supabase (getAllMarketStatsManual) ошибка:', error.message);
-    return [];
-  }
-  return data || [];
 }

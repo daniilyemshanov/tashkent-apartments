@@ -51,12 +51,12 @@ node --test client/api/_telegramApi.test.js client/api/_updateDedupe.test.js cli
 npm run build --prefix client
 ```
 
-Для проверки разрешения импорта market-stat модулей без соединения с базой (используются фиктивные process-local значения, запросов не выполняется):
+Для проверки разрешения импорта модуля работы с базой без соединения с ней (используются фиктивные process-local значения, запросов не выполняется):
 
 ```powershell
 $env:SUPABASE_URL = 'https://contract-test.invalid'
 $env:SUPABASE_SERVICE_KEY = 'contract-test-key'
-node --input-type=module -e "await import('./scraper/src/marketStats.js'); console.log('imports ok')"
+node --input-type=module -e "await import('./scraper/src/db.js'); console.log('imports ok')"
 Remove-Item Env:SUPABASE_URL, Env:SUPABASE_SERVICE_KEY
 ```
 
