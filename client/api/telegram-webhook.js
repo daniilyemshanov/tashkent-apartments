@@ -35,7 +35,7 @@ import { buildListingText, buildListingButtons } from './_listingMessage.js';
 import { cleanAgentMessagesBatch } from './_cleanAgents.js';
 import { parseSearchQuery } from './_aiSearch.js';
 import { runChatHelper, getHint, HELP_TEXT, menuKeyboard } from './_chatHelper.js';
-import { isDuplicateUpdate } from './_updateDedupe.js';
+import { throwOnSupabaseError } from './_dbErrors.js';
 
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 
@@ -75,19 +75,25 @@ const SEARCH_WINDOW_DAYS = 14; // не тащим совсем старые об
 // ---------- session (bot_sessions table) ----------
 
 async function getSession(chatId, userId) {
-  const { data } = await supabase
+  const started = Date.now();
+  const { data, error } = await supabase
     .from('bot_sessions')
     .select('state')
     .eq('chat_id', chatId)
     .eq('user_id', userId)
     .maybeSingle();
+  throwOnSupabaseError('getSession', error);
+  console.log(JSON.stringify({ event: 'supabase_query', operation: 'getSession', duration_ms: Date.now() - started }));
   return data?.state || null;
 }
 
 async function saveSession(chatId, userId, state) {
-  await supabase
+  const started = Date.now();
+  const { error } = await supabase
     .from('bot_sessions')
     .upsert({ chat_id: chatId, user_id: userId, state: { ...state, ts: Date.now() }, updated_at: new Date().toISOString() });
+  throwOnSupabaseError('saveSession', error);
+  console.log(JSON.stringify({ event: 'supabase_query', operation: 'saveSession', duration_ms: Date.now() - started }));
 }
 
 function displayName(from) {
@@ -439,88 +445,56 @@ function listingPriceUzs(l) {
 // ---------- search ----------
 
 async function runSearch(filters) {
-  let query = supabase.from('listings').select('*').order('created_at', { ascending: false }).range(0, 999);
-
-  // Агентства (label_kind='agent') не показываем — как и на сайте/в
-  // push-уведомлениях, их снова полностью скрываем.
-  query = query.neq('label_kind', 'agent');
-
-  if (filters.dealType) query = query.eq('deal_type', filters.dealType);
-  if (filters.propertyType && filters.propertyType !== 'any') query = query.eq('property_type', filters.propertyType);
-  if (filters.districts?.length) query = query.in('district', filters.districts);
-  // filters.rooms теперь массив (можно искать сразу "2 и 3 комнаты",
-  // как и раньше можно было выбрать сразу несколько районов) — по
-  // просьбе Владика 24.08.2026. Supabase не даёт напрямую смешать
-  // .in() и .gte() одним вызовом на одну колонку, поэтому при наличии
-  // "5plus" вместе с обычными числами собираем OR-условие вручную.
-  if (filters.rooms?.length) {
-    const numeric = filters.rooms.filter((r) => r !== '5plus').map(Number);
-    const has5plus = filters.rooms.includes('5plus');
-    if (has5plus && numeric.length) {
-      query = query.or(`rooms.in.(${numeric.join(',')}),rooms.gte.5`);
-    } else if (has5plus) {
-      query = query.gte('rooms', 5);
-    } else if (numeric.length) {
-      query = query.in('rooms', numeric);
-    }
-  }
-
+  const started = Date.now();
   const cutoff = new Date(Date.now() - SEARCH_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
-  query = query.gte('created_at', cutoff);
-
-  const { data, error } = await query;
-  if (error) {
-    console.error('Ошибка поиска в Supabase:', error.message);
-    return [];
+  const rows = [];
+  // Supabase caps a response at 1,000 rows. Read bounded pages until exhausted
+  // so post-query currency and text filters cannot silently miss matches.
+  for (let from = 0; ; from += 1000) {
+    let query = supabase.from('listings')
+      .select('title,price,price_value,price_currency,district,rooms,area,url,label_kind,raw_text,created_at')
+      .order('created_at', { ascending: false }).range(from, from + 999)
+      .neq('label_kind', 'agent').neq('is_duplicate', true).gte('created_at', cutoff);
+    if (filters.dealType) query = query.eq('deal_type', filters.dealType);
+    if (filters.propertyType && filters.propertyType !== 'any') query = query.eq('property_type', filters.propertyType);
+    if (filters.districts?.length) query = query.in('district', filters.districts);
+    if (filters.rooms?.length) {
+      const numeric = filters.rooms.filter((r) => r !== '5plus').map(Number).filter(Number.isFinite);
+      const has5plus = filters.rooms.includes('5plus');
+      if (has5plus && numeric.length) query = query.or(`rooms.in.(${numeric.join(',')}),rooms.gte.5`);
+      else if (has5plus) query = query.gte('rooms', 5);
+      else if (numeric.length) query = query.in('rooms', numeric);
+    }
+    if (filters.areaRange?.min != null) query = query.gte('area', filters.areaRange.min);
+    if (filters.areaRange?.max != null) query = query.lte('area', filters.areaRange.max);
+    if (filters.priceRange) {
+      const minUzs = toUzs(filters.priceRange.min, filters.priceRange.currency);
+      const maxUzs = toUzs(filters.priceRange.max, filters.priceRange.currency);
+      const bounds = (currency, divisor) => {
+        const parts = [`price_currency.eq.${currency}`];
+        if (minUzs != null) parts.push(`price_value.gte.${minUzs / divisor}`);
+        if (maxUzs != null) parts.push(`price_value.lte.${maxUzs / divisor}`);
+        return `and(${parts.join(',')})`;
+      };
+      query = query.or(`${bounds('USD', EXCHANGE_RATE_USD_UZS)},${bounds('UZS', 1)}`);
+    }
+    const { data, error } = await query;
+    if (error) {
+      console.error(JSON.stringify({ event: 'supabase_error', operation: 'runSearch', message: error.message, duration_ms: Date.now() - started }));
+      throw new Error(`Supabase search failed: ${error.message}`);
+    }
+    rows.push(...(data || []));
+    if (!data || data.length < 1000) break;
   }
-
-  let results = data || [];
-
-  if (filters.priceRange) {
-    const minUzs = toUzs(filters.priceRange.min, filters.priceRange.currency);
-    const maxUzs = toUzs(filters.priceRange.max, filters.priceRange.currency);
-    results = results.filter((l) => {
-      const priceUzs = listingPriceUzs(l);
-      if (priceUzs === null) return false; // без цены — не знаем, попадает ли в диапазон
-      if (minUzs !== null && priceUzs < minUzs) return false;
-      if (maxUzs !== null && priceUzs > maxUzs) return false;
-      return true;
-    });
+  let results = rows;
+  if (filters.queryText) {
+    const needle = filters.queryText.toLocaleLowerCase();
+    results = results.filter((l) => `${l.raw_text || ''} ${l.title || ''} ${l.district || ''}`.toLocaleLowerCase().includes(needle));
   }
-
-  // Площадь — по просьбе Владика 24.08.2026: для коммерции комнат нет,
-  // но площадь как раз то, по чему там реально фильтруют. Та же логика,
-  // что и с ценой: без площади в объявлении — не знаем, попадает ли в
-  // диапазон, лучше отбросить, чем показать заведомо нерелевантное.
-  if (filters.areaRange) {
-    const { min, max } = filters.areaRange;
-    results = results.filter((l) => {
-      if (l.area == null) return false;
-      if (min != null && l.area < min) return false;
-      if (max != null && l.area > max) return false;
-      return true;
-    });
-  }
-
-  // Собственники сверху, дальше новые сверху — та же логика, что и на сайте.
   const rank = { owner: 0, unchecked: 1, uncertain: 2, agent: 3 };
-  results.sort((a, b) => {
-    const rd = (rank[a.label_kind] ?? 1) - (rank[b.label_kind] ?? 1);
-    if (rd !== 0) return rd;
-    return new Date(b.created_at) - new Date(a.created_at);
-  });
-
-  // В сессию кладём только компактные поля — полная строка на 100+
-  // объявлений в jsonb не нужна и раздувает таблицу.
-  return results.slice(0, 100).map((l) => ({
-    title: l.title,
-    price: l.price,
-    district: l.district,
-    rooms: l.rooms,
-    area: l.area,
-    url: l.url,
-    label_kind: l.label_kind,
-  }));
+  results.sort((a, b) => (rank[a.label_kind] ?? 1) - (rank[b.label_kind] ?? 1) || new Date(b.created_at) - new Date(a.created_at));
+  console.log(JSON.stringify({ event: 'supabase_query', operation: 'runSearch', rows: rows.length, results: results.length, duration_ms: Date.now() - started }));
+  return results.map((l) => ({ title: l.title, price: l.price, district: l.district, rooms: l.rooms, area: l.area, url: l.url, label_kind: l.label_kind }));
 }
 
 async function renderResultsPage(chatId, messageId, state) {
@@ -864,23 +838,11 @@ async function handleAiSearch(chatId, userId, queryText, threadId) {
     rooms: f.rooms || [], // теперь массив, как и district — можно сразу "2-3 комнаты" (см. _aiSearch.js)
     areaRange: f.areaMin != null || f.areaMax != null ? { min: f.areaMin, max: f.areaMax } : null,
     priceRange,
+    queryText: f.q || null,
   };
 
-  let results = await runSearch(filters);
+  const results = await runSearch(filters);
 
-  // f.q — то, что ИИ не смог разложить по полям (например конкретный
-  // ЖК, "с ремонтом", пожелание по инфраструктуре) — фильтруем
-  // ДОПОЛНИТЕЛЬНО текстовым совпадением. Раньше проверялся только
-  // title — а такие детали почти всегда пишут в ОПИСАНИИ, а не в
-  // заголовке (жалоба пользователя 24.08.2026: "чтобы иишка тоже
-  // могла искать по описаниям"). runSearch делает select('*'), так
-  // что raw_text (title+описание, см. run.js) уже есть в каждой
-  // записи — используем его, как и обычный поиск на сайте
-  // (client/api/listings.js: title/district/raw_text через ilike).
-  if (f.q) {
-    const needle = f.q.toLowerCase();
-    results = results.filter((l) => (l.raw_text || l.title || '').toLowerCase().includes(needle));
-  }
 
   const state = { filters, results, offset: 0 };
 
@@ -1184,6 +1146,7 @@ export default async function handler(req, res) {
     return;
   }
 
+  const requestStarted = Date.now();
   const update = req.body;
   // Чат берём из сообщения или из сообщения, под которым нажали кнопку.
   const updateChatId = update?.message?.chat?.id ?? update?.callback_query?.message?.chat?.id;
@@ -1192,9 +1155,18 @@ export default async function handler(req, res) {
     res.status(200).json({ ok: true, ignored: true });
     return;
   }
-  if (isDuplicateUpdate(update?.update_id)) {
-    res.status(200).json({ ok: true, duplicate: true });
-    return;
+  if (update?.update_id != null) {
+    const { data: claimed, error } = await supabase.rpc('claim_telegram_update', { p_update_id: update.update_id });
+    if (error) {
+      console.error(JSON.stringify({ event: 'supabase_error', operation: 'claimTelegramUpdate', message: error.message }));
+      res.status(503).json({ error: 'update deduplication unavailable' });
+      return;
+    }
+    if (!claimed) {
+      console.log(JSON.stringify({ event: 'telegram_update_duplicate', update_id: update.update_id }));
+      res.status(200).json({ ok: true, duplicate: true });
+      return;
+    }
   }
 
   try {
@@ -1227,7 +1199,8 @@ export default async function handler(req, res) {
     }
   }
 
-  // Telegram ждёт 200 OK независимо от результата обработки — иначе
-  // будет повторять доставку того же апдейта.
+  // Do not acknowledge before processing: Vercel may freeze work after the
+  // response, which would lose updates. Log completion without user identifiers.
+  console.log(JSON.stringify({ event: 'telegram_update_complete', duration_ms: Date.now() - requestStarted }));
   res.status(200).json({ ok: true });
 }

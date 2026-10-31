@@ -32,7 +32,7 @@ export async function getListingById(id) {
   const { data, error } = await supabase
     .from('listings')
     .select(
-      'id, url, title, price, price_value, price_currency, price_per_sqm, raw_text, district, rooms, area, phone, phone_normalized, seller_name, seller_type, confidence, label_kind, label_text, seller_listings_count, market_segment, owner_score, is_duplicate, duplicate_of_id, duplicate_reason, entity_key, price_history, price_history_count, price_drop_count, price_change_count, last_price_change_pct, last_price_change_at, first_seen_price_value, last_seen_price_value, notified, created_at'
+      'id, url, title, price, price_value, price_currency, price_per_sqm, raw_text, district, rooms, area, phone, phone_normalized, seller_name, seller_type, confidence, label_kind, label_text, seller_listings_count, market_segment, owner_score, is_duplicate, duplicate_of_id, duplicate_reason, entity_key, price_history, price_history_count, price_drop_count, price_change_count, last_price_change_pct, last_price_change_at, first_seen_price_value, last_seen_price_value, published_at, notified, created_at'
     )
     .eq('id', id)
     .maybeSingle();
@@ -207,3 +207,64 @@ export async function saveTopicId(groupKey, district, messageThreadId) {
   }
 }
 
+
+// Market statistics persistence used by scraper/src/marketStats.js.
+// Keep these calls bounded and paginate source listings so the PostgREST
+// default row cap cannot silently skew the computed medians.
+export async function getStatsSourceListings(lookbackDays = 45) {
+  const days = Number.isFinite(Number(lookbackDays)) && Number(lookbackDays) > 0 ? Number(lookbackDays) : 45;
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const pageSize = 1000;
+  const rows = [];
+
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await supabase
+      .from('listings')
+      .select('id, created_at, property_type, deal_type, district, price_per_sqm, price_currency, market_segment')
+      .gte('created_at', cutoff)
+      .not('price_per_sqm', 'is', null)
+      .in('label_kind', ['owner', 'unchecked'])
+      .or('is_duplicate.is.null,is_duplicate.eq.false')
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (error) {
+      console.error('Supabase (getStatsSourceListings) ошибка:', error.message);
+      return [];
+    }
+    rows.push(...(data || []));
+    if (!data || data.length < pageSize) return rows;
+  }
+}
+
+export async function upsertMarketStats(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return true;
+  const { error } = await supabase.from('market_stats').upsert(rows, { onConflict: 'group_key' });
+  if (error) {
+    console.error('Supabase (upsertMarketStats) ошибка:', error.message);
+    return false;
+  }
+  return true;
+}
+
+export async function getAllMarketStats() {
+  const { data, error } = await supabase
+    .from('market_stats')
+    .select('group_key, median_price_per_sqm, sample_size');
+  if (error) {
+    console.error('Supabase (getAllMarketStats) ошибка:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
+export async function getAllMarketStatsManual() {
+  const { data, error } = await supabase
+    .from('market_stats_manual')
+    .select('group_key, median_price_per_sqm');
+  if (error) {
+    console.error('Supabase (getAllMarketStatsManual) ошибка:', error.message);
+    return [];
+  }
+  return data || [];
+}

@@ -1,0 +1,97 @@
+name: Supabase database backup
+
+on:
+  schedule:
+    - cron: '29 2 * * 0'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-database-backup
+  cancel-in-progress: false
+
+jobs:
+  export-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require a private repository for data artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +x
+          private=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .private)
+          if [ "$private" != "true" ]; then
+            echo '::error::Backups are not uploaded from public repositories because they contain listing data.'
+            exit 1
+          fi
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+      - name: Export schema, roles, and table data
+        shell: bash
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set +x
+          if [ -z "$SUPABASE_DB_URL" ]; then
+            echo '::error::SUPABASE_DB_URL secret is not configured'
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/supabase-backup"
+          if ! supabase db dump --db-url "$SUPABASE_DB_URL" --role-only -f "$RUNNER_TEMP/supabase-backup/roles.sql" >/dev/null 2>"$RUNNER_TEMP/roles.err"; then
+            echo '::error::Supabase roles export failed; details were suppressed to protect credentials'
+            exit 1
+          fi
+          if ! supabase db dump --db-url "$SUPABASE_DB_URL" -f "$RUNNER_TEMP/supabase-backup/schema.sql" >/dev/null 2>"$RUNNER_TEMP/schema.err"; then
+            echo '::error::Supabase schema export failed; details were suppressed to protect credentials'
+            exit 1
+          fi
+          if ! supabase db dump --db-url "$SUPABASE_DB_URL" --data-only --use-copy -x storage.buckets_vectors -x storage.vector_indexes -f "$RUNNER_TEMP/supabase-backup/data.sql" >/dev/null 2>"$RUNNER_TEMP/data.err"; then
+            echo '::error::Supabase data export failed; details were suppressed to protect credentials'
+            exit 1
+          fi
+          test -s "$RUNNER_TEMP/supabase-backup/roles.sql"
+          test -s "$RUNNER_TEMP/supabase-backup/schema.sql"
+          test -s "$RUNNER_TEMP/supabase-backup/data.sql"
+          tar -czf "$RUNNER_TEMP/supabase-backup.tar.gz" -C "$RUNNER_TEMP" supabase-backup
+          gzip -t "$RUNNER_TEMP/supabase-backup.tar.gz"
+          bytes=$(wc -c < "$RUNNER_TEMP/supabase-backup.tar.gz")
+          if [ "$bytes" -gt 104857600 ]; then
+            echo '::error::Compressed backup exceeds the 100 MiB safety limit; artifact was not uploaded'
+            exit 1
+          fi
+          (cd "$RUNNER_TEMP" && sha256sum supabase-backup.tar.gz > supabase-backup.sha256)
+          echo "Backup archive verified; compressed size ${bytes} bytes."
+      - name: Upload private workflow artifact (14-day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-backup-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/supabase-backup.tar.gz
+            ${{ runner.temp }}/supabase-backup.sha256
+          retention-days: 14
+          if-no-files-found: error
+      - name: Preview old listing candidates
+        if: success() && vars.ENABLE_LISTING_RETENTION_PREVIEW == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          LISTING_RETENTION_DAYS: ${{ vars.LISTING_RETENTION_DAYS }}
+        run: node .github/scripts/cleanup-listings.mjs --preview
+      - name: Purge old listings only after explicit opt-in
+        if: success() && vars.ENABLE_LISTING_RETENTION_PREVIEW == 'true' && vars.ENABLE_LISTING_RETENTION_CLEANUP == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          LISTING_RETENTION_DAYS: ${{ vars.LISTING_RETENTION_DAYS }}
+        run: node .github/scripts/cleanup-listings.mjs --purge
+      - name: Notify admin if backup fails
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+        run: node .github/scripts/telegram-alert.mjs '⚠️ Workflow резервной копии или очистки завершился ошибкой. Проверьте GitHub Actions; артефакт резервной копии мог уже быть создан.'

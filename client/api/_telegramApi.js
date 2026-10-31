@@ -5,6 +5,7 @@
 
 const TOKEN = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const API = `https://api.telegram.org/bot${TOKEN}`;
+const TELEGRAM_TIMEOUT_MS = Number(process.env.TELEGRAM_API_TIMEOUT_MS) || 8000;
 
 function assertConfigured() {
   if (!TOKEN) {
@@ -14,16 +15,25 @@ function assertConfigured() {
 
 async function call(method, payload) {
   assertConfigured();
-  const res = await fetch(`${API}/${method}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!data.ok) {
-    console.error(`Telegram API ошибка (${method}):`, data.description);
-  }
-  return data;
+  const started = Date.now();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TELEGRAM_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${API}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal });
+    const data = await res.json();
+    const description = String(data?.description || '');
+    const expectedNoop = method === 'editMessageText' && /message is not modified/i.test(description);
+    const expiredCallback = method === 'answerCallbackQuery' && /query is too old|query ID is invalid/i.test(description);
+    if (!data?.ok && !expectedNoop && !expiredCallback) console.error(JSON.stringify({ event: 'telegram_api_error', method, status: res.status, description, duration_ms: Date.now() - started }));
+    else if (process.env.LOG_API_TIMINGS === 'true') console.log(JSON.stringify({ event: 'telegram_api', method, duration_ms: Date.now() - started, ok: !!data?.ok }));
+    return data;
+  } catch (error) {
+    const timedOut = error?.name === 'AbortError';
+    console.error(JSON.stringify({ event: 'telegram_api_failure', method, kind: timedOut ? 'timeout' : 'network', duration_ms: Date.now() - started }));
+    const failure = new Error(`Telegram ${method} ${timedOut ? 'timed out' : 'request failed'}`);
+    failure.cause = error;
+    throw failure;
+  } finally { clearTimeout(timeout); }
 }
 
 export function sendMessage(chatId, text, extra = {}) {

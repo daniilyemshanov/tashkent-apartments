@@ -1,6 +1,7 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 process.env.TELEGRAM_BOT_TOKEN = 'test-token';
+process.env.TELEGRAM_API_TIMEOUT_MS = '20';
 const { editMessageText, answerCallbackQuery } = await import('./_telegramApi.js');
 
 const originalFetch = globalThis.fetch;
@@ -79,4 +80,12 @@ test('callback acknowledgement is issued as one API call', async () => {
   };
   await answerCallbackQuery('valid-callback-id');
   assert.equal(requests, 1);
+});
+
+
+test('Telegram network calls abort at the configured timeout', async () => {
+  globalThis.fetch = (_url, { signal }) => new Promise((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+  });
+  await assert.rejects(answerCallbackQuery('timeout-callback'), /Telegram answerCallbackQuery timed out/);
 });

@@ -19,6 +19,7 @@ import {
   countListingsByPhone,
 } from './db.js';
 import { normalizeDistrict } from './districts.js';
+import { parsePublishedAt } from './publicationDate.js';
 import { parsePrice, toUsd } from './priceParser.js';
 import { cleanAgentBacklog } from './cleanAgentMessages.js';
 import { findAgentTextSignal } from './agentSignals.js';
@@ -671,6 +672,7 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
 
     const listing = {
       ...item,
+      published_at: parsePublishedAt(item.posted_raw) ?? existingById?.published_at ?? null,
       raw_text: rawText,
       seller_name: sellerName,
       seller_listings_count: sellerListingsCount,
