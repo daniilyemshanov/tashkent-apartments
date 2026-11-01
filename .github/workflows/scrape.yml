@@ -91,6 +91,9 @@ jobs:
       # галочкой force пропускает эту проверку.
       - name: Ночной режим (реже ночью)
         id: gate
+        # Репозиторий на этом шаге ещё не скачан, поэтому папки scraper
+        # (defaults.run.working-directory) пока нет — берём корень.
+        working-directory: .
         env:
           FORCE: ${{ inputs.force }}
           INTERVAL: ${{ vars.NIGHT_INTERVAL_MIN || 60 }}
