@@ -28,7 +28,7 @@
 // короткий мастер из кнопок.
 
 import { supabase } from './_supabase.js';
-import { sendMessage, editMessageText, answerCallbackQuery, escapeHtml, deleteMessage } from './_telegramApi.js';
+import { sendMessage, editMessageText, editMessageReplyMarkup, answerCallbackQuery, escapeHtml, deleteMessage } from './_telegramApi.js';
 import { DISTRICTS, districtSlug, districtFromSlug } from './_districts.js';
 import { parsePriceRange, hasExplicitCurrency } from './_priceParser.js';
 import { buildListingText, buildListingButtons } from './_listingMessage.js';
@@ -119,6 +119,14 @@ async function refreshListingMessage(chatId, messageId, listingId) {
   // отказывается парсить текст и правка тихо не применяется. Текст
   // карточки и так без HTML-разметки (как и при первой отправке из
   // scraper/telegram.js), поэтому здесь явно отключаем HTML-режим.
+  // Пост-формат (альбом + сообщение-карта с кнопками): у карты нет
+  // текста — правим только кнопки, со статусом прямо на них.
+  if (Array.isArray(listing.telegram_extra_message_ids) && listing.telegram_extra_message_ids.length) {
+    await editMessageReplyMarkup(chatId, messageId, {
+      inline_keyboard: buildListingButtons(listing, { statusInLabels: true }),
+    });
+    return listing;
+  }
   await editMessageText(chatId, messageId, buildListingText(listing), {
     parse_mode: undefined,
     reply_markup: { inline_keyboard: buildListingButtons(listing) },
@@ -335,8 +343,17 @@ async function toggleFlaggedAgent(chatId, messageId, listingId, agentName, callb
     // просто перекрашивается. Снятие пометки (next === false) ничего
     // не восстанавливает — Telegram не даёт "отменить" удаление,
     // сообщение всё равно уже отправлено один раз в прошлом.
+    const { data: postRow } = await supabase
+      .from('listings')
+      .select('telegram_extra_message_ids')
+      .eq('id', listingId)
+      .maybeSingle();
     const deleted = await deleteMessage(chatId, messageId);
     if (deleted) {
+      // Пост-формат: вместе с картой удаляем и фото альбома.
+      for (const extraId of Array.isArray(postRow?.telegram_extra_message_ids) ? postRow.telegram_extra_message_ids : []) {
+        await deleteMessage(chatId, extraId).catch(() => false);
+      }
       await supabase.from('listings').update({ telegram_deleted: true }).eq('id', listingId);
       await answerCallbackQuery(callbackId, '🚫 Отмечено как агентство — сообщение удалено');
       return;

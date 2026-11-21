@@ -108,11 +108,15 @@ export async function saveListing(listing, previousListing = null) {
         flagged_at: previousListing.flagged_at ?? null,
         telegram_chat_id: previousListing.telegram_chat_id ?? null,
         telegram_message_id: previousListing.telegram_message_id ?? null,
+        ...(previousListing.telegram_extra_message_ids ? { telegram_extra_message_ids: previousListing.telegram_extra_message_ids } : {}),
         telegram_deleted: previousListing.telegram_deleted ?? false,
         notified: previousListing.notified ?? false,
       }
     : { contacted: false };
-  const payload = { ...listing, ...preserved };
+  // image_urls — только для альбома в Telegram, колонки в базе нет
+  // (в памяти у listing поле остаётся, отправка идёт после сохранения).
+  const { image_urls: _imageUrls, ...listingForDb } = listing;
+  const payload = { ...listingForDb, ...preserved };
   const { error } = await supabase.from('listings').upsert(payload, { onConflict: 'id' });
   if (error) {
     console.error('Supabase (saveListing) ошибка:', error.message);
@@ -139,6 +143,33 @@ export async function markNotified(id, sentTo) {
   if (error) {
     console.error('Supabase (markNotified) ошибка:', error.message);
   }
+  // id сообщений альбома — отдельным запросом: если миграция
+  // 19_album_message_ids.sql ещё не выполнена, это не должно ломать
+  // основную отметку notified выше.
+  if (sentTo?.extraMessageIds?.length) {
+    const { error: extraError } = await supabase
+      .from('listings')
+      .update({ telegram_extra_message_ids: sentTo.extraMessageIds })
+      .eq('id', id);
+    if (extraError) {
+      console.warn('Supabase (markNotified, extra ids) — выполнена ли миграция 19_album_message_ids.sql?', extraError.message);
+    }
+  }
+}
+
+/**
+ * id остальных сообщений поста (фото альбома) по chat_id/message_id
+ * сообщения с кнопками. Пусто, если колонки/записи нет.
+ */
+export async function getExtraMessageIds(chatId, messageId) {
+  const { data, error } = await supabase
+    .from('listings')
+    .select('telegram_extra_message_ids')
+    .eq('telegram_chat_id', String(chatId))
+    .eq('telegram_message_id', messageId)
+    .maybeSingle();
+  if (error || !Array.isArray(data?.telegram_extra_message_ids)) return [];
+  return data.telegram_extra_message_ids;
 }
 
 /**

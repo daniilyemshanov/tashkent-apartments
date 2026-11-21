@@ -1,3 +1,4 @@
+import { extractImageUrlsFromHtml } from '../postFormat.js';
 import * as cheerio from 'cheerio';
 import { getWithRetry } from '../http.js';
 import { detectMarketSegment } from '../marketSegment.js';
@@ -225,6 +226,7 @@ export async function fetchDomtutDetails(url) {
     // sendListingCard в telegram.js) всегда падают в текстовый
     // фоллбэк, даже когда у объявления реально есть фото на сайте.
     const imageUrl = $('meta[property="og:image"]').attr('content') || null;
+    const imageUrls = extractImageUrlsFromHtml($);
     return {
       description,
       sellerName,
@@ -232,6 +234,7 @@ export async function fetchDomtutDetails(url) {
       sellerIsOrganization: isOrganization,
       sellerNameLooksLikeAgent: isOrganization,
       imageUrl,
+      imageUrls,
       marketSegment: detectMarketSegment(rawText) || 'new_build',
     };
   } catch (err) {

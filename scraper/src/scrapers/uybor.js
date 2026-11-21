@@ -226,6 +226,7 @@ export async function fetchUyborListings(dealType = 'rent', propertyType = 'apar
       seller_name: sellerName,
       raw_district: rawDistrict,
       image_url: imageUrl,
+      image_urls: extractUyborImages(item),
       // Best-effort: у Uybor нет отдельного поля "новостройка/вторичка",
       // подтверждённого вживую (fetchUyborDetails ниже даже не тянет
       // описание, см. комментарий там) — поэтому ищем явную фразу
@@ -244,6 +245,16 @@ export async function fetchUyborListings(dealType = 'rent', propertyType = 'apar
  * вероятных структур (массив строк / массив объектов с url|path|src).
  * Относительные пути достраиваем до полного URL.
  */
+function extractUyborImages(item) {
+  const media = item.media || item.images || item.photos;
+  if (!Array.isArray(media)) return [];
+  return media
+    .map((m) => (typeof m === 'string' ? m : m?.url || m?.path || m?.src || m?.image || null))
+    .filter(Boolean)
+    .map((c) => (c.startsWith('http') ? c : `https://api.uybor.uz${c.startsWith('/') ? '' : '/'}${c}`))
+    .slice(0, 10);
+}
+
 function extractUyborImage(item) {
   const media = item.media || item.images || item.photos;
   if (!Array.isArray(media) || media.length === 0) return null;

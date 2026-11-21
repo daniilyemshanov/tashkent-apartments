@@ -22,7 +22,7 @@ async function call(method, payload) {
     const res = await fetch(`${API}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal });
     const data = await res.json();
     const description = String(data?.description || '');
-    const expectedNoop = method === 'editMessageText' && /message is not modified/i.test(description);
+    const expectedNoop = (method === 'editMessageText' || method === 'editMessageReplyMarkup') && /message is not modified/i.test(description);
     const expiredCallback = method === 'answerCallbackQuery' && /query is too old|query ID is invalid/i.test(description);
     if (!data?.ok && !expectedNoop && !expiredCallback) console.error(JSON.stringify({ event: 'telegram_api_error', method, status: res.status, description, duration_ms: Date.now() - started }));
     else if (process.env.LOG_API_TIMINGS === 'true') console.log(JSON.stringify({ event: 'telegram_api', method, duration_ms: Date.now() - started, ok: !!data?.ok }));
@@ -55,6 +55,12 @@ export function editMessageText(chatId, messageId, text, extra = {}) {
     disable_web_page_preview: true,
     ...extra,
   });
+}
+
+// Для карточек-локаций (пост-формат): у такого сообщения нет текста,
+// поэтому обновляем только кнопки.
+export function editMessageReplyMarkup(chatId, messageId, replyMarkup) {
+  return call('editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: replyMarkup });
 }
 
 export function answerCallbackQuery(callbackQueryId, text = '') {

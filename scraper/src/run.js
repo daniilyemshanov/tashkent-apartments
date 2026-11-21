@@ -280,6 +280,10 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       // так что тут его не перезаписываем.
       if (details?.locationDistrict && !item.raw_district) item.raw_district = details.locationDistrict;
       if (details?.imageUrl && !item.image_url) item.image_url = details.imageUrl;
+      // Все фото для альбома (в базу НЕ пишутся — см. saveListing в db.js)
+      if (Array.isArray(details?.imageUrls) && details.imageUrls.length > (item.image_urls?.length || 0)) {
+        item.image_urls = details.imageUrls;
+      }
       consecutiveDetailFailures = 0;
     } catch (err) {
       detailsFetchFailed = true;

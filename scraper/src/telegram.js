@@ -1,5 +1,12 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { getTopicId } from './db.js';
+import { getTopicId, getExtraMessageIds } from './db.js';
+import { getDistrictCoords } from './geo.js';
+import { buildPostCaption, collectPhotos } from './postFormat.js';
+
+// Формат карточки: 'post' (по умолчанию) — альбом фото + подпись как у
+// риэлторских каналов (см. postFormat.js), ссылка на объявление внутри.
+// TELEGRAM_POST_STYLE=legacy — вернуть старую карточку с эмодзи и кнопками.
+const POST_STYLE = (process.env.TELEGRAM_POST_STYLE || 'post').trim().toLowerCase() !== 'legacy';
 
 const token = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
 const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
@@ -183,6 +190,8 @@ function trimToCaption(text, max = 1024) {
  * @returns {Promise<{message: import('node-telegram-bot-api').Message, sentAsPhoto: boolean}>}
  */
 async function sendListingCard(targetChatId, listing, { message, buttons }, extraOpts = {}) {
+  if (POST_STYLE) return sendListingPost(targetChatId, listing, extraOpts, buttons);
+
   if (listing.image_url) {
     try {
       const sent = await bot.sendPhoto(targetChatId, listing.image_url, {
@@ -192,10 +201,6 @@ async function sendListingCard(targetChatId, listing, { message, buttons }, extr
       });
       return { message: sent, sentAsPhoto: true };
     } catch (err) {
-      // Частые причины: Telegram не смог скачать картинку по ссылке
-      // (сайт-источник блокирует прямые запросы не из браузера, ссылка
-      // уже протухла, формат не поддерживается). Не роняем всё
-      // уведомление целиком — просто уходим в текстовый фоллбэк ниже.
       console.warn(
         `[sendListingCard] Не удалось отправить фото (${listing.image_url}) для "${listing.title}" — отправляю текстом:`,
         err.message
@@ -208,6 +213,93 @@ async function sendListingCard(targetChatId, listing, { message, buttons }, extr
     ...extraOpts,
   });
   return { message: sent, sentAsPhoto: false };
+}
+
+/**
+ * Пост в стиле каналов недвижимости: альбом из фото (до 10) с подписью
+ * на первом фото; одно фото — обычное фото с подписью; нет фото (или
+ * Telegram не смог их скачать) — текстовое сообщение без превью.
+ *
+ * Кнопки к альбому прикрепить нельзя (ограничение Telegram), поэтому
+ * после него идёт сообщение-карта района с кнопками.
+ */
+async function sendListingPost(targetChatId, listing, extraOpts, buttons) {
+  const caption = trimToCaption(buildPostCaption(listing));
+  const photos = collectPhotos(listing);
+  const albumIds = [];
+  let sentAsPhoto = false;
+
+  if (photos.length >= 2) {
+    try {
+      const sentList = await bot.sendMediaGroup(
+        targetChatId,
+        photos.map((url, i) => ({ type: 'photo', media: url, ...(i === 0 ? { caption } : {}) })),
+        extraOpts
+      );
+      sentList.forEach((m) => albumIds.push(m.message_id));
+      sentAsPhoto = true;
+    } catch (err) {
+      // Одна нерабочая ссылка роняет весь альбом — пробуем по одному фото.
+      console.warn(`[sendListingPost] Альбом не отправился (${photos.length} фото) для "${listing.title}":`, err.message);
+    }
+  }
+
+  if (!albumIds.length) {
+    for (const url of photos.slice(0, 3)) {
+      try {
+        const sent = await bot.sendPhoto(targetChatId, url, { caption, ...extraOpts });
+        albumIds.push(sent.message_id);
+        sentAsPhoto = true;
+        break;
+      } catch (err) {
+        console.warn(`[sendListingPost] Фото не отправилось (${url}):`, err.message);
+      }
+    }
+  }
+
+  if (!albumIds.length) {
+    const sent = await bot.sendMessage(targetChatId, caption, { disable_web_page_preview: true, ...extraOpts });
+    albumIds.push(sent.message_id);
+  }
+
+  // Под постом — сообщение с картой района и кнопками. К самому
+  // альбому кнопки Telegram прикрепить не даёт, зато даёт к
+  // сообщению-локации. Нет района/карта не отправилась — обычное
+  // текстовое сообщение с теми же кнопками.
+  const markup = { inline_keyboard: buttons };
+  let control = null;
+  const coords = getDistrictCoords(listing.district);
+  if (coords) {
+    try {
+      control = await bot.sendVenue(
+        targetChatId,
+        coords[0],
+        coords[1],
+        `📍 ${listing.district}`,
+        'примерно, на месте уточним',
+        { reply_markup: markup, ...extraOpts }
+      );
+    } catch (err) {
+      console.warn(`[sendListingPost] Карта не отправилась для "${listing.title}":`, err.message);
+    }
+  }
+  if (!control) {
+    try {
+      control = await bot.sendMessage(targetChatId, `📍 ${listing.district || 'Район не указан'}`, {
+        reply_markup: markup,
+        ...extraOpts,
+      });
+    } catch (err) {
+      console.warn(`[sendListingPost] Сообщение с кнопками не отправилось:`, err.message);
+    }
+  }
+
+  // Если кнопочное сообщение не ушло — главным считаем первое
+  // сообщение поста (как раньше, без кнопок).
+  if (!control) {
+    return { message: { chat: { id: targetChatId }, message_id: albumIds[0] }, extraMessageIds: [], sentAsPhoto };
+  }
+  return { message: control, extraMessageIds: albumIds, sentAsPhoto };
 }
 
 export async function notifyNewListing(listing) {
@@ -293,7 +385,11 @@ export async function notifyToTopicGroup(listing) {
     const sent = await sendListingCard(targetChatId, listing, payload, {
       ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
     });
-    return { chatId: String(sent.message.chat.id), messageId: sent.message.message_id };
+    return {
+      chatId: String(sent.message.chat.id),
+      messageId: sent.message.message_id,
+      extraMessageIds: sent.extraMessageIds || [],
+    };
   } catch (err) {
     console.error(`Не удалось отправить в тематическую супергруппу (${groupKey}):`, err.message);
     return null;
@@ -311,6 +407,15 @@ export async function notifyToTopicGroup(listing) {
 export async function deleteTelegramMessage(chatId, messageId) {
   if (!bot || !chatId || !messageId) return false;
   try {
+    // Пост-формат: кроме сообщения с кнопками есть ещё фото альбома.
+    const extraIds = await getExtraMessageIds(chatId, messageId);
+    for (const extraId of extraIds) {
+      try {
+        await bot.deleteMessage(chatId, extraId);
+      } catch (err) {
+        console.warn(`Не удалось удалить сообщение альбома ${extraId}:`, err.message);
+      }
+    }
     await bot.deleteMessage(chatId, messageId);
     return true;
   } catch (err) {
@@ -336,8 +441,11 @@ export async function deleteTelegramMessage(chatId, messageId) {
  */
 export async function editNotifiedMessageText(listing) {
   if (!bot || !listing?.telegram_chat_id || !listing?.telegram_message_id) return false;
-  const { message } = buildMessagePayload(listing);
-  const target = { chat_id: listing.telegram_chat_id, message_id: listing.telegram_message_id };
+  const message = POST_STYLE ? buildPostCaption(listing) : buildMessagePayload(listing).message;
+  // В пост-формате подпись висит на первом фото альбома, а не на
+  // сообщении с кнопками.
+  const firstAlbumId = Array.isArray(listing.telegram_extra_message_ids) ? listing.telegram_extra_message_ids[0] : null;
+  const target = { chat_id: listing.telegram_chat_id, message_id: firstAlbumId || listing.telegram_message_id };
 
   const isNotModified = (err) => /message is not modified/i.test(err.message);
   // "there is no text in the message to edit" — именно так Telegram

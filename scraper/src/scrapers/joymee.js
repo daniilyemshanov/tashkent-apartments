@@ -299,6 +299,9 @@ export async function fetchJoymeeDetails(url) {
   const ldPrice = priceValue ? `${Number(priceValue) || priceValue} ${priceCurrencyDisplay}`.trim() : null;
 
   const imageUrl = extractJoymeeDetailImage(item);
+  const imageUrls = Array.isArray(item?.media)
+    ? item.media.map((m) => m?.file?.url).filter(Boolean).slice(0, 10)
+    : [];
 
   // См. marketSegment.js — у Joymee, в отличие от Uybor, есть полное
   // description с описанием (item?.description выше), плюс title из
@@ -318,6 +321,7 @@ export async function fetchJoymeeDetails(url) {
     phone,
     ldPrice,
     imageUrl,
+    imageUrls,
     marketSegment,
   };
 }

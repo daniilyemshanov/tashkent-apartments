@@ -46,7 +46,9 @@ export function buildListingText(listing) {
   );
 }
 
-export function buildListingButtons(listing) {
+// statusInLabels — для пост-формата (сообщение-карта без текста): кто
+// взял в работу/связался показываем прямо на кнопках.
+export function buildListingButtons(listing, { statusInLabels = false } = {}) {
   const buttons = [];
   if (listing.phone) {
     const digits = listing.phone.replace(/[^\d]/g, '');
@@ -62,12 +64,25 @@ export function buildListingButtons(listing) {
   }
   buttons.push([{ text: '🔗 Открыть объявление', url: listing.url }]);
   buttons.push([
-    { text: listing.contacted ? '↩️ Снять «Связался»' : '✅ Связался', callback_data: `ct:${listing.id}` },
-    { text: listing.assigned_to ? '↩️ Освободить' : '👤 Беру в работу', callback_data: `as:${listing.id}` },
+    {
+      text: listing.contacted
+        ? statusInLabels ? `↩️ Связался: ${listing.contacted_by || '—'}` : '↩️ Снять «Связался»'
+        : '✅ Связался',
+      callback_data: `ct:${listing.id}`,
+    },
+    {
+      text: listing.assigned_to
+        ? statusInLabels ? `↩️ В работе: ${listing.assigned_to}` : '↩️ Освободить'
+        : '👤 Беру в работу',
+      callback_data: `as:${listing.id}`,
+    },
   ]);
   buttons.push([
     { text: listing.flagged_agent ? '↩️ Вернуть как собственника' : '🚫 Это агент', callback_data: `fl:${listing.id}` },
-    { text: '📝 Заметка', callback_data: `nt:${listing.id}` },
+    {
+      text: statusInLabels && listing.notes ? `📝 ${String(listing.notes).slice(0, 40)}` : '📝 Заметка',
+      callback_data: `nt:${listing.id}`,
+    },
   ]);
   return buttons;
 }

@@ -1,3 +1,4 @@
+import { extractImageUrlsFromHtml } from '../postFormat.js';
 import * as cheerio from 'cheerio';
 import { getWithRetry } from '../http.js';
 import { detectMarketSegment } from '../marketSegment.js';
@@ -408,6 +409,7 @@ export async function fetchRealtingDetails(url) {
   }
 
   const imageUrl = $('meta[property="og:image"]').attr('content') || null;
+  const imageUrls = extractImageUrlsFromHtml($);
 
   // См. marketSegment.js — ищем по всему тексту страницы, как и
   // sellerType чуть выше (тот же pageText, дополнительных запросов не
