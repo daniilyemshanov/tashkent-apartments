@@ -2,6 +2,10 @@ import TelegramBot from 'node-telegram-bot-api';
 import { getTopicId, getExtraMessageIds } from './db.js';
 import { getDistrictCoords } from './geo.js';
 import { buildPostCaption, collectPhotos } from './postFormat.js';
+import { cleanPhoto, cleanPhotos } from './imageClean.js';
+
+// Для Buffer-фото Telegram-библиотеке нужны имя файла и тип
+const JPG = { filename: 'photo.jpg', contentType: 'image/jpeg' };
 
 // Формат карточки: 'post' (по умолчанию) — альбом фото + подпись как у
 // риэлторских каналов (см. postFormat.js), ссылка на объявление внутри.
@@ -194,11 +198,11 @@ async function sendListingCard(targetChatId, listing, { message, buttons }, extr
 
   if (listing.image_url) {
     try {
-      const sent = await bot.sendPhoto(targetChatId, listing.image_url, {
+      const sent = await bot.sendPhoto(targetChatId, await cleanPhoto(listing.image_url), {
         caption: trimToCaption(message),
         reply_markup: { inline_keyboard: buttons },
         ...extraOpts,
-      });
+      }, JPG);
       return { message: sent, sentAsPhoto: true };
     } catch (err) {
       console.warn(
@@ -225,7 +229,7 @@ async function sendListingCard(targetChatId, listing, { message, buttons }, extr
  */
 async function sendListingPost(targetChatId, listing, extraOpts, buttons) {
   const caption = trimToCaption(buildPostCaption(listing));
-  const photos = collectPhotos(listing);
+  const photos = await cleanPhotos(collectPhotos(listing)); // OLX: срезан водяной знак
   const albumIds = [];
   let sentAsPhoto = false;
 
@@ -233,7 +237,7 @@ async function sendListingPost(targetChatId, listing, extraOpts, buttons) {
     try {
       const sentList = await bot.sendMediaGroup(
         targetChatId,
-        photos.map((url, i) => ({ type: 'photo', media: url, ...(i === 0 ? { caption } : {}) })),
+        photos.map((url, i) => ({ type: 'photo', media: url, fileOptions: JPG, ...(i === 0 ? { caption } : {}) })),
         extraOpts
       );
       sentList.forEach((m) => albumIds.push(m.message_id));
@@ -247,12 +251,12 @@ async function sendListingPost(targetChatId, listing, extraOpts, buttons) {
   if (!albumIds.length) {
     for (const url of photos.slice(0, 3)) {
       try {
-        const sent = await bot.sendPhoto(targetChatId, url, { caption, ...extraOpts });
+        const sent = await bot.sendPhoto(targetChatId, url, { caption, ...extraOpts }, JPG);
         albumIds.push(sent.message_id);
         sentAsPhoto = true;
         break;
       } catch (err) {
-        console.warn(`[sendListingPost] Фото не отправилось (${url}):`, err.message);
+        console.warn(`[sendListingPost] Фото не отправилось (${typeof url === 'string' ? url : 'buffer'}):`, err.message);
       }
     }
   }
