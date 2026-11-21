@@ -13,7 +13,7 @@ import { throwOnSupabaseError } from './_dbErrors.js';
 const SESSION_TTL_MS = 6 * 60 * 60 * 1000; // через 6 часов тишины диалог начинается заново
 const DAILY_LIMIT = Number(process.env.TG_AI_DAILY_LIMIT) || 30; // сообщений на человека в сутки (защита бюджета)
 const KEEP_MSGS = 8;
-const MAX_TG_BODY = 3300;
+const MAX_TG_BODY = 2600; // запас: ссылки под вариантами добавляют длину, лимит Telegram 4096
 const RESET_RE = /^(сброс|новый|новая|заново|reset|new)$/i;
 
 const ERROR_TEXT = {
@@ -49,18 +49,46 @@ export async function loadContinuation(message) {
   return state;
 }
 
-function formatAnswer(reply, cards, firstTurn) {
-  let body = escapeHtml(reply);
-  if (body.length > MAX_TG_BODY) body = body.slice(0, MAX_TG_BODY) + '…';
-  const lines = (cards || [])
-    .filter((c) => /^https?:\/\//.test(c.url || ''))
-    .map((c) => {
-      const label = [c.price, c.rooms ? `${c.rooms} комн.` : null, c.district].filter(Boolean).join(' · ') || c.title || 'объявление';
-      return `🏠 <a href="${attr(c.url)}">${escapeHtml(label)}</a>`;
-    });
-  let out = body + (lines.length ? `\n\n${lines.join('\n')}` : '');
-  if (firstTurn) out += '\n\n<i>Продолжайте, отвечая (Reply) на это сообщение. Начать заново: /ai новый</i>';
-  return out;
+const hostLabel = (url) => {
+  try {
+    const h = new URL(url).hostname.replace(/^www\./, '');
+    if (/olx\./.test(h)) return 'OLX';
+    const name = h.split('.')[0];
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  } catch {
+    return 'Объявление';
+  }
+};
+
+/** Ссылки под вариантом: источник (OLX и т. п.) и пост в нашей группе. */
+function linkLine(card) {
+  const parts = [];
+  if (/^https?:\/\//.test(card.url || '')) parts.push(`🔗 <a href="${attr(card.url)}">${escapeHtml(hostLabel(card.url))}</a>`);
+  if (card.tg) parts.push(`💬 <a href="${attr(card.tg)}">Пост в группе</a>`);
+  return parts.join('  ·  ');
+}
+
+/**
+ * Метки [id:…] в тексте заменяются ссылками прямо под соответствующим вариантом.
+ * Карточки, которых ИИ в тексте не назвал, не добавляем; выдуманные id просто вырезаются.
+ */
+function formatAnswer(replyRaw, cards, firstTurn) {
+  const byId = new Map((cards || []).map((c) => [c.id, c]));
+  // Режем ДО превращения в HTML (иначе можно разрезать тег <a> пополам, и Telegram отклонит сообщение)
+  let raw = replyRaw;
+  if (raw.length > MAX_TG_BODY) {
+    raw = raw.slice(0, MAX_TG_BODY);
+    raw = raw.slice(0, Math.max(raw.lastIndexOf('\n'), 0) || MAX_TG_BODY).replace(/\[id:[^\]]*$/, '') + '…';
+  }
+  let body = escapeHtml(raw);
+  body = body.replace(/[ \t]*\[id:([\w.-]+)\]/g, (_, id) => {
+    const card = byId.get(id);
+    const line = card && linkLine(card);
+    return line ? `\n${line}` : '';
+  });
+  body = body.replace(/\n{3,}/g, '\n\n').trim();
+  if (firstTurn) body += '\n\n<i>Продолжайте, отвечая (Reply) на это сообщение. Начать заново: /ai новый</i>';
+  return body;
 }
 
 /**
@@ -104,7 +132,7 @@ export async function handleTgAiChat(message, text, state = null) {
     return;
   }
 
-  const html = formatAnswer(result.reply, result.cards, msgs.length === 0);
+  const html = formatAnswer(result.replyRaw, result.cards, msgs.length === 0);
   let botMsgId = placeholderId;
   if (placeholderId) {
     const edited = await editMessageText(chatId, placeholderId, html);

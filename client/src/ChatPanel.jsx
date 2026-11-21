@@ -82,14 +82,18 @@ export default function ChatPanel({ authFetch, onClose }) {
             {m.cards?.length > 0 && (
               <div className="chat-cards">
                 {m.cards.map((c) => (
-                  <a key={c.id} className="chat-card" href={c.url} target="_blank" rel="noreferrer">
+                  <div key={c.id} className="chat-card">
                     {c.image && <img src={c.image} alt="" loading="lazy" />}
                     <div>
                       <div className="chat-card-price">{c.price}</div>
                       <div className="chat-card-title">{c.title}</div>
                       <div className="chat-card-sub">{[c.district, c.rooms && `${c.rooms} комн.`].filter(Boolean).join(' · ')}</div>
+                      <div className="chat-card-links">
+                        {c.url && <a href={c.url} target="_blank" rel="noreferrer">🔗 Объявление</a>}
+                        {c.tg && <a href={c.tg} target="_blank" rel="noreferrer">💬 Пост в группе</a>}
+                      </div>
                     </div>
-                  </a>
+                  </div>
                 ))}
               </div>
             )}

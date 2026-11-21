@@ -495,3 +495,7 @@ select:focus{ outline:none; border-color:var(--gold); }
 .chat-input{ display:flex; gap:6px; padding:10px; border-top:1px solid var(--border-soft); }
 .chat-input input{ flex:1; }
 .chat-fab{ position:fixed; right:16px; bottom:16px; z-index:55; }
+
+.chat-card-links{ display:flex; gap:12px; margin-top:4px; font-size:12px; }
+.chat-card-links a{ color:var(--gold-bright); text-decoration:none; }
+.chat-card-links a:hover{ text-decoration:underline; }
