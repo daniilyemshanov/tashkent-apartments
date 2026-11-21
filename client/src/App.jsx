@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef, memo } from 'react';
 import { supabase, supabaseConfigMissing } from './lib/supabaseClient.js';
 import { DISTRICTS } from './districts.js';
+import ChatPanel from './ChatPanel.jsx';
 
 const REFRESH_MS = 20000;
 const PAGE_SIZE = 30;
@@ -550,6 +551,7 @@ function Dashboard() {
   const [session, setSession] = useState(undefined);
   const [authorized, setAuthorized] = useState(null);
   const [showTeam, setShowTeam] = useState(false);
+  const [showChat, setShowChat] = useState(false);
 
   const [items, setItems] = useState([]);
   const [page, setPage] = useState(0);
@@ -1036,6 +1038,10 @@ function Dashboard() {
           <span>{statusText} · {session.user.email}</span>
         </div>
       </header>
+
+      {showChat
+        ? <ChatPanel authFetch={authFetch} onClose={() => setShowChat(false)} />
+        : <button className="btn chat-fab" onClick={() => setShowChat(true)}>💬 ИИ-помощник</button>}
 
       {showTeam && (
         <TeamPanel authFetch={authFetch} myEmail={session.user.email} onClose={() => setShowTeam(false)} />

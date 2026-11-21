@@ -36,6 +36,7 @@ import { cleanAgentMessagesBatch } from './_cleanAgents.js';
 import { parseSearchQuery } from './_aiSearch.js';
 import { runChatHelper, getHint, HELP_TEXT, menuKeyboard } from './_chatHelper.js';
 import { throwOnSupabaseError } from './_dbErrors.js';
+import { handleTgAiChat, loadContinuation } from './_tgAiChat.js';
 
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 
@@ -999,7 +1000,7 @@ async function handleMenuCallback(cb, action) {
   else if (action === 'ai')
     await sendMessage(
       chatId,
-      '💬 Напишите после <code>/search</code>, что ищете, например:\n<code>/search 2-комнатная в Чиланзаре до 600$, от собственника</code>',
+      '💬 Напишите после <code>/ai</code>, что ищете, и уточняйте ответами на сообщения ИИ:\n<code>/ai 2-комнатная в Чиланзаре до 600$, от собственника</code>',
       threadExtra(threadId)
     );
   else if (action === 'today') await handleToday(chatId, threadId);
@@ -1084,6 +1085,27 @@ async function handleMessage(message) {
   if (cmd === '/clean') {
     await handleClean(message.chat.id, threadId);
     return;
+  }
+  // ИИ-чат по базе: /ai текст — начать, ответ (Reply) на сообщение ИИ — продолжить
+  if (cmd === '/ai' || cmd === '/чат' || cmd === '/помощник') {
+    const queryText = commandArgs(message);
+    if (!queryText) {
+      await sendMessage(
+        message.chat.id,
+        '💬 Общайтесь с ИИ по нашей базе, например:\n<code>/ai 3-комнатная на покупку в Юнусабаде до 100000$ с хорошим ремонтом</code>\n\nПотом уточняйте, отвечая (Reply) на его сообщение: «а подороже, ремонт получше», «только от собственника».',
+        threadExtra(threadId)
+      );
+      return;
+    }
+    await handleTgAiChat(message, queryText);
+    return;
+  }
+  if (message.text && !cmd && message.reply_to_message?.from?.is_bot) {
+    const aiState = await loadContinuation(message);
+    if (aiState) {
+      await handleTgAiChat(message, message.text, aiState);
+      return;
+    }
   }
   if (cmd === '/search' || cmd === '/найти') {
     const queryText = commandArgs(message);
