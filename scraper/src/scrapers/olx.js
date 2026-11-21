@@ -489,7 +489,27 @@ export async function fetchOlxDetails(url, { skipPhone = false } = {}) {
   // якорь сама по себе, риск ложного совпадения в другом месте страницы
   // минимален, а привязка к вёрстке (как показал опыт с "Все объявления
   // автора" выше) — самое хрупкое место.
-  const marketSegment = detectMarketSegment(bodyText);
+  // Только явная строка "Тип жилья: ..." или текст самого объявления:
+  // по всему bodyText слово "Новостройка" ловится из меню/фильтров и
+  // ложно помечает вторичку как новостройку.
+  const explicitSegment = bodyText.match(/Тип\s+жилья\s*:\s*(новостройк|вторичн)/i);
+  const marketSegment = explicitSegment
+    ? (/^новостр/i.test(explicitSegment[1]) ? 'new_build' : 'secondary')
+    : detectMarketSegment(`${$('h1').first().text()}\n${description}`);
+
+  // Цена в ТОЙ валюте, в которой её видит покупатель на странице
+  // ("46 000 у.е."): JSON-LD у OLX может отдавать пересчёт в сумы,
+  // из-за чего у объявления в $ получалась цена в миллионах сум.
+  let pagePrice = null;
+  const priceEl = $('[data-testid="ad-price-container"]').first().text().replace(/\s+/g, ' ').trim();
+  const priceSource = priceEl || (bodyText.match(/Опубликовано.{0,80}?\d{1,2}:\d{2}(.{0,300})/)?.[1] || '');
+  const priceMatch = priceSource.match(/(\d[\d\s]{2,18}\d)\s*(у\.\s?е\.?|y\.\s?e\.?|сум|\$)/i);
+  if (priceMatch) pagePrice = `${priceMatch[1].replace(/\s+/g, ' ').trim()} ${priceMatch[2]}`;
+
+  if (!sellerName) {
+    const sn = bodyText.match(/ПОЛЬЗОВАТЕЛЬ\s+(.{2,40}?)\s+на\s+OLX\s+с/i);
+    if (sn) sellerName = sn[1].trim();
+  }
 
   return {
     description,
@@ -503,6 +523,7 @@ export async function fetchOlxDetails(url, { skipPhone = false } = {}) {
     imageUrl,
     imageUrls,
     paramsText: extractParamsFromHtml($),
+    pagePrice,
     marketSegment,
   };
 }

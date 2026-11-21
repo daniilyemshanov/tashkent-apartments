@@ -30,7 +30,14 @@ export const MAX_PHOTOS = 10; // лимит Telegram на один альбом
  */
 export function parseFloors(...texts) {
   const text = texts.filter(Boolean).join(' \n ');
-  if (!text) return { floor: null, floorsTotal: null };
+  if (!text) return { floor: null, floorsTotal: null, rooms: null };
+
+  // "2/2/2", "3/5/9" в названии — по-узбекски: комнаты/этаж/этажность
+  const triple = text.match(/(?<![\d/])(\d{1,2})\s*\/\s*(\d{1,2})\s*\/\s*(\d{1,2})(?![\d/])/);
+  if (triple) {
+    const [r, f, tot] = [Number(triple[1]), Number(triple[2]), Number(triple[3])];
+    if (r >= 1 && r <= 10 && f >= 1 && f <= tot && tot <= 60) return { floor: f, floorsTotal: tot, rooms: r };
+  }
 
   const patterns = [
     // этаж 3/9 | этаж: 3 из 9 | этаж - 3 / 9
@@ -101,7 +108,7 @@ const CAPTION_LIMIT = 1024;
 // Строки-параметры вида "Этаж: 3" — собираем со страницы объявления
 // (cheerio $), только знакомые ключи, чтобы не тащить мусор вёрстки.
 const PARAM_KEY_RE =
-  /^(этаж|этажность|этажей|количество комнат|комнат|общая площадь|площадь|жилая площадь|площадь кухни|ремонт|состояние|мебел|планировка|санузел|тип дома|тип здания|материал|год постройки|год|отопление|парковка|лифт|балкон|документ|депозит|предоплата|коммунальн|вид из окон|высота потолк|тип сделки|срок аренды|меблирован|бытовая техника|техника)/i;
+  /^(этаж|этажность|этажей|количество комнат|комнат|общая площадь|площадь|жилая площадь|площадь кухни|ремонт|состояние|мебел|планировка|санузел|тип дома|тип здания|материал|год постройки|год|отопление|парковка|лифт|балкон|документ|депозит|предоплата|коммунальн|вид из окон|высота потолк|тип сделки|срок аренды|меблирован|бытовая техника|техника|тип жилья|тип строения|комиссионн|в квартире есть|рядом есть|санузел|планировка)/i;
 
 export function extractParamsFromHtml($) {
   const lines = [];
@@ -109,8 +116,8 @@ export function extractParamsFromHtml($) {
     const $el = $(el);
     if ($el.children().length > 3) return;
     const text = $el.clone().find('style, script').remove().end().text().replace(/\s+/g, ' ').trim();
-    if (text.length < 5 || text.length > 90) return;
-    const m = text.match(/^([^:]{2,40}):\s*(\S.{0,50})$/);
+    if (text.length < 5 || text.length > 220) return;
+    const m = text.match(/^([^:]{2,40}):\s*(\S.{0,190})$/);
     if (!m || !PARAM_KEY_RE.test(m[1].trim())) return;
     const line = `${m[1].trim()}: ${m[2].trim()}`;
     if (!lines.includes(line)) lines.push(line);
@@ -190,6 +197,14 @@ export function extractFacts(listing) {
   }
   if (condition) facts.push(`Ремонт: ${condition.toLowerCase()}`);
 
+  // Дом, планировка, санузел — из характеристик карточки
+  const building = paramValue(params, 'тип строения|тип дома|материал');
+  if (building) facts.push(`Дом: ${building.toLowerCase()}`);
+  const layout = paramValue(params, 'планировка');
+  if (layout) facts.push(`Планировка: ${layout.toLowerCase()}`);
+  const bath = paramValue(params, 'санузел');
+  if (bath) facts.push(`Санузел: ${bath.toLowerCase()}`);
+
   // Мебель
   const furnitureParam = paramValue(params, 'меблирован|мебел');
   if (furnitureParam) {
@@ -215,6 +230,9 @@ export function extractFacts(listing) {
   if (/детск\w+\s+площадк/.test(low)) extras.push('детская площадка');
   if (extras.length) facts.push(`Есть: ${extras.join(', ')}`);
 
+  const nearby = paramValue(params, 'рядом есть');
+  if (nearby) facts.push(`Рядом: ${nearby.length > 70 ? `${nearby.slice(0, 67).replace(/[,\s]+\S*$/, '')}…` : nearby}`);
+
   // Метро/ориентир из текста
   const metro = text.match(/метро\s+([А-ЯЁA-Z][\wА-Яа-яёЁ'’-]{2,25})|([А-ЯЁA-Z][\wА-Яа-яёЁ'’-]{2,25})\s+метро/);
   const metroName = metro ? (metro[1] || metro[2]) : null;
@@ -223,7 +241,9 @@ export function extractFacts(listing) {
   // Условия
   const deposit = text.match(/(?:депозит|залог|предоплат\w*)\s*[:\-–]?\s*([^\n.,;]{1,30})/i);
   if (listing.deal_type === 'rent' && deposit) facts.push(`Депозит: ${deposit[1].trim()}`);
-  if (/без\s+комисси|безмаклер|без\s+маклер|без\s+посредник|от\s+хозяина|от\s+собственник|egasidan|vositachi\s+bo['’]?lmagan/.test(low)) {
+  const commissionParam = paramValue(params, 'комиссионн');
+  if (commissionParam && /^нет|^no/i.test(commissionParam)) facts.push('Без комиссии');
+  else if (/без\s+комисси|безмаклер|без\s+маклер|без\s+посредник|от\s+хозяина|от\s+собственник|egasidan|vositachi\s+bo['’]?lmagan/.test(low)) {
     facts.push('Без комиссии');
   }
   if (/торг\s+уместен|уместен\s+торг|возможен\s+торг|торг(?:\s+есть)?\b(?!\s+не)|kelishamiz/.test(low) && !/без\s+торг|торга\s+нет|торг\s+не/.test(low)) {
@@ -304,12 +324,20 @@ function fitDescription(text, budget) {
  * Подпись поста. Только обычный текст (без parse_mode) — в ссылках
  * бывают & и _, которые ломают Markdown/HTML-разметку.
  */
+/** Приводит телефон к виду +998 99 123 45 67 (OLX отдаёт кривые "+99 891 9593377"). */
+export function formatPhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length < 9) return phone || null;
+  const n = digits.slice(-9);
+  return `+998 ${n.slice(0, 2)} ${n.slice(2, 5)} ${n.slice(5, 7)} ${n.slice(7, 9)}`;
+}
+
 export function buildPostCaption(listing) {
   const fromText = parseFloors(listing.title, listing.raw_text);
   const fromParams = parseParams(listing.params_text);
   const floor = fromParams.floor ?? fromText.floor;
   const floorsTotal = fromParams.floorsTotal ?? fromText.floorsTotal;
-  const rooms = listing.rooms ?? fromParams.rooms;
+  const rooms = listing.rooms ?? fromParams.rooms ?? fromText.rooms ?? null;
   const areaValue = listing.area ?? fromParams.area;
 
   const segmentTag =
@@ -366,7 +394,7 @@ export function buildPostCaption(listing) {
   if (bottomTags) tail.push(bottomTags);
   tail.push('————————————————');
   if (listing.seller_name) tail.push(`👤 ${listing.seller_name}`);
-  if (listing.phone) tail.push(`📞 ${listing.phone}`);
+  if (listing.phone) tail.push(`📞 ${formatPhone(listing.phone)}`);
   tail.push(`🔗 ${listing.url}`);
 
   // Описание занимает всё, что осталось в лимите подписи (1024) —

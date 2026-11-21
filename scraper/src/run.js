@@ -270,7 +270,10 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       // мусором. Теперь ldPrice тоже обязан пройти ту же проверку —
       // если не проходит, просто не используем её, остаётся то, что
       // было найдено (и уже провалидировано) на странице списка.
-      if (details?.ldPrice && isPlausiblePrice(details.ldPrice, dealType)) {
+      if (details?.pagePrice && isPlausiblePrice(details.pagePrice, dealType)) {
+        // Цена как на странице объявления (с исходной валютой) — приоритет
+        item.price = details.pagePrice;
+      } else if (details?.ldPrice && isPlausiblePrice(details.ldPrice, dealType)) {
         if (propertyType !== 'commercial' || !item.price) {
           item.price = details.ldPrice;
         }

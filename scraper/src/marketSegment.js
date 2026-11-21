@@ -23,6 +23,11 @@ const SECONDARY_RE = /вторичн(?:ый|ого|ом)?\s*рынок[а-я]*/i
  */
 export function detectMarketSegment(text) {
   if (!text) return null;
+  // Явная строка характеристик OLX ("Тип жилья: Вторичный рынок") —
+  // главный якорь. Без неё слово "Новостройка" часто ловится из меню/
+  // фильтров страницы и ложно даёт new_build у обычной вторички.
+  const explicit = text.match(/Тип\s+жилья\s*:\s*(новостройк|вторичн)/i);
+  if (explicit) return /^новостр/i.test(explicit[1]) ? 'new_build' : 'secondary';
   if (NEW_BUILD_RE.test(text)) return 'new_build';
   if (SECONDARY_RE.test(text)) return 'secondary';
   return null;
