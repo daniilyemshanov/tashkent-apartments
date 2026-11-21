@@ -29,3 +29,13 @@ Claude Haiku 5.5 сам вызывает инструмент `search_listings` 
 
 ## Стоимость (Haiku 5.5: $0.10 вход / $0.50 выход за 1 млн токенов, цены на октябрь 2026)
 Одно сообщение ≈ $0.001–0.0025 (в среднем ≈ $0.0013). Реальные токены каждого запроса пишутся в логи Vercel: `ai-chat: … in=… out=…`.
+
+## Если ИИ говорит «в базе ничего нет»
+Проверьте, что реально лежит в базе (Supabase → SQL Editor):
+```sql
+select deal_type, price_currency, count(*) as n
+from listings
+where is_duplicate is not true and coalesce(label_kind,'') <> 'agent' and flagged_agent is not true
+group by 1,2 order by n desc;
+```
+Если продаж в USD мало или нет, ИИ честно ответит «ничего нет». Это вопрос наполнения базы скрапером, а не чата.

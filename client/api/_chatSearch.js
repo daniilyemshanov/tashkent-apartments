@@ -26,12 +26,28 @@ export const SEARCH_TOOL = {
       ownerOnly: { type: 'boolean', description: 'Только от собственника' },
       text: { type: 'string', description: 'Слова для поиска в заголовке/описании: «евроремонт», «ЖК Мирабад»' },
       sort: { type: 'string', enum: ['new', 'price_asc', 'price_desc'] },
-      excludeIds: { type: 'array', items: { type: 'integer' }, description: 'Уже показанные объявления — не повторять' },
+      excludeIds: { type: 'array', items: { type: 'string' }, description: 'Уже показанные объявления — не повторять' },
     },
   },
 };
 
 const clip = (s, n) => (s ? String(s).replace(/\s+/g, ' ').trim().slice(0, n) : null);
+
+// При пустой выдаче даём модели реальные цифры по базе, чтобы она не гадала («в основном аренда»)
+async function baseCounts() {
+  const count = async (build) => {
+    let q = supabase.from('listings').select('id', { count: 'exact', head: true })
+      .neq('is_duplicate', true).neq('label_kind', 'agent').neq('flagged_agent', true);
+    const { count: n, error } = await build(q);
+    return error ? null : n;
+  };
+  const [sale, saleUsd, rent] = await Promise.all([
+    count((q) => q.eq('deal_type', 'sale')),
+    count((q) => q.eq('deal_type', 'sale').eq('price_currency', 'USD')),
+    count((q) => q.eq('deal_type', 'rent')),
+  ]);
+  return { sale_total: sale, sale_in_usd: saleUsd, rent_total: rent };
+}
 
 export async function searchListings(a = {}) {
   let q = supabase
@@ -62,7 +78,9 @@ export async function searchListings(a = {}) {
     q = q.or(`title.ilike.%${e}%,raw_text.ilike.%${e}%`);
   }
   if (Array.isArray(a.excludeIds) && a.excludeIds.length) {
-    q = q.not('id', 'in', `(${a.excludeIds.filter(Number.isInteger).join(',')})`);
+    // id в базе текстовые (olx_4vwhz): пропускаем только безопасные значения и берём в кавычки
+    const ids = a.excludeIds.filter((x) => typeof x === 'string' && /^[\w.-]{1,64}$/.test(x));
+    if (ids.length) q = q.not('id', 'in', `(${ids.map((x) => `"${x}"`).join(',')})`);
   }
 
   if (a.sort === 'price_asc') q = q.order('price_value', { ascending: true, nullsFirst: false });
@@ -71,6 +89,7 @@ export async function searchListings(a = {}) {
 
   const { data, error } = await q.limit(MAX_RESULTS);
   if (error) return { error: error.message, items: [] };
+  if (!data?.length) return { count: 0, items: [], base: await baseCounts() };
 
   const items = (data || []).map((r) => ({
     id: r.id,
