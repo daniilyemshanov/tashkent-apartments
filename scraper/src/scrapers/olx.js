@@ -2,7 +2,7 @@ import * as cheerio from 'cheerio';
 import { getWithRetry } from '../http.js';
 import { parsePrice } from '../priceParser.js';
 import { detectMarketSegment } from '../marketSegment.js';
-import { extractImageUrlsFromHtml } from '../postFormat.js';
+import { extractParamsFromHtml, extractImageUrlsFromHtml } from '../postFormat.js';
 
 // Два раздела — аренда и продажа квартир по Ташкенту. Забираем ВСЕ
 // объявления в каждом, не только помеченные сайтом "от собственника"
@@ -502,6 +502,7 @@ export async function fetchOlxDetails(url, { skipPhone = false } = {}) {
     ldPrice,
     imageUrl,
     imageUrls,
+    paramsText: extractParamsFromHtml($),
     marketSegment,
   };
 }

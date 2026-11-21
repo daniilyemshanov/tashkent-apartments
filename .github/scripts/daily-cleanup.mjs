@@ -41,6 +41,15 @@ async function callRpc(baseUrl, key, args, fetchImpl = fetch) {
     if (!response.ok) {
       const error = new Error(`daily_cleanup RPC HTTP ${response.status}`);
       error.status = response.status;
+      // Код и текст ошибки PostgREST (напр. 42501 permission denied,
+      // 42703 нет колонки) — в них нет секретов, зато сразу видно причину.
+      try {
+        const body = await response.json();
+        error.pgCode = body?.code;
+        error.pgMessage = String(body?.message || '').slice(0, 200);
+      } catch {
+        // тело не JSON — не критично
+      }
       throw error;
     }
     return await response.json();
@@ -122,6 +131,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     console.error(JSON.stringify({
       event: 'daily_cleanup_failed',
       reason: error?.name === 'AbortError' ? 'timeout' : missing ? 'function_missing' : 'request_or_configuration_error',
+      // Подробности без секретов — чтобы по логу было видно, что именно не так.
+      http_status: error?.status,
+      pg_code: error?.pgCode,
+      detail: error?.pgMessage || (error?.status ? undefined : String(error?.message || '').slice(0, 200)),
     }));
     await sendTelegramAlert(
       missing

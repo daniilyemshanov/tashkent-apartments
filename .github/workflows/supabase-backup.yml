@@ -18,14 +18,15 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Require a private repository for data artifacts
+      - name: Require a private repository or an encryption passphrase
         env:
           GH_TOKEN: ${{ github.token }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_ENCRYPTION_PASSPHRASE }}
         run: |
           set +x
           private=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .private)
-          if [ "$private" != "true" ]; then
-            echo '::error::Backups are not uploaded from public repositories because they contain listing data.'
+          if [ "$private" != "true" ] && [ -z "$BACKUP_PASSPHRASE" ]; then
+            echo '::error::Public repository: set the BACKUP_ENCRYPTION_PASSPHRASE secret so the backup is encrypted before upload (or make the repository private).'
             exit 1
           fi
       - uses: supabase/setup-cli@v1
@@ -35,6 +36,7 @@ jobs:
         shell: bash
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          BACKUP_PASSPHRASE: ${{ secrets.BACKUP_ENCRYPTION_PASSPHRASE }}
         run: |
           set +x
           if [ -z "$SUPABASE_DB_URL" ]; then
@@ -64,14 +66,24 @@ jobs:
             echo '::error::Compressed backup exceeds the 100 MiB safety limit; artifact was not uploaded'
             exit 1
           fi
-          (cd "$RUNNER_TEMP" && sha256sum supabase-backup.tar.gz > supabase-backup.sha256)
+          # Шифруем (AES-256), если задан пароль: в публичном репозитории
+          # артефакты может скачать любой вошедший в GitHub, поэтому без
+          # шифрования данные наружу не отдаём. Расшифровать:
+          #   gpg -d supabase-backup.tar.gz.gpg > supabase-backup.tar.gz
+          if [ -n "$BACKUP_PASSPHRASE" ]; then
+            printf '%s' "$BACKUP_PASSPHRASE" | gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+              --symmetric --cipher-algo AES256 -o "$RUNNER_TEMP/supabase-backup.tar.gz.gpg" "$RUNNER_TEMP/supabase-backup.tar.gz"
+            test -s "$RUNNER_TEMP/supabase-backup.tar.gz.gpg"
+            rm -f "$RUNNER_TEMP/supabase-backup.tar.gz"
+          fi
+          (cd "$RUNNER_TEMP" && sha256sum supabase-backup.tar.gz* > supabase-backup.sha256)
           echo "Backup archive verified; compressed size ${bytes} bytes."
       - name: Upload private workflow artifact (14-day retention)
         uses: actions/upload-artifact@v4
         with:
           name: supabase-backup-${{ github.run_id }}
           path: |
-            ${{ runner.temp }}/supabase-backup.tar.gz
+            ${{ runner.temp }}/supabase-backup.tar.gz*
             ${{ runner.temp }}/supabase-backup.sha256
           retention-days: 14
           if-no-files-found: error

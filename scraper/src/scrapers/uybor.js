@@ -1,3 +1,4 @@
+import { paramsTextFromApiItem } from '../postFormat.js';
 import { getWithRetry } from '../http.js';
 import { detectMarketSegment } from '../marketSegment.js';
 
@@ -227,6 +228,7 @@ export async function fetchUyborListings(dealType = 'rent', propertyType = 'apar
       raw_district: rawDistrict,
       image_url: imageUrl,
       image_urls: extractUyborImages(item),
+      params_text: paramsTextFromApiItem(item),
       // Best-effort: у Uybor нет отдельного поля "новостройка/вторичка",
       // подтверждённого вживую (fetchUyborDetails ниже даже не тянет
       // описание, см. комментарий там) — поэтому ищем явную фразу

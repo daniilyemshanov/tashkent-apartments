@@ -1,4 +1,4 @@
-import { extractImageUrlsFromHtml } from '../postFormat.js';
+import { extractParamsFromHtml, extractImageUrlsFromHtml } from '../postFormat.js';
 import * as cheerio from 'cheerio';
 import { getWithRetry } from '../http.js';
 import { detectMarketSegment } from '../marketSegment.js';

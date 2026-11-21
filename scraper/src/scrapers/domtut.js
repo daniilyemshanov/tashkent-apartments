@@ -1,4 +1,4 @@
-import { extractImageUrlsFromHtml } from '../postFormat.js';
+import { extractParamsFromHtml, extractImageUrlsFromHtml } from '../postFormat.js';
 import * as cheerio from 'cheerio';
 import { getWithRetry } from '../http.js';
 import { detectMarketSegment } from '../marketSegment.js';
@@ -235,6 +235,7 @@ export async function fetchDomtutDetails(url) {
       sellerNameLooksLikeAgent: isOrganization,
       imageUrl,
       imageUrls,
+      paramsText: extractParamsFromHtml($),
       marketSegment: detectMarketSegment(rawText) || 'new_build',
     };
   } catch (err) {

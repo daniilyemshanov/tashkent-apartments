@@ -92,12 +92,225 @@ function formatArea(area) {
   return `${Number.isInteger(n) ? n : String(n).replace('.', ',')}кв.м`;
 }
 
+
+// ---------- дополнительные факты и описание ----------
+
+const EXCHANGE_RATE = Number(process.env.EXCHANGE_RATE_USD_UZS) || 12700;
+const CAPTION_LIMIT = 1024;
+
+// Строки-параметры вида "Этаж: 3" — собираем со страницы объявления
+// (cheerio $), только знакомые ключи, чтобы не тащить мусор вёрстки.
+const PARAM_KEY_RE =
+  /^(этаж|этажность|этажей|количество комнат|комнат|общая площадь|площадь|жилая площадь|площадь кухни|ремонт|состояние|мебел|планировка|санузел|тип дома|тип здания|материал|год постройки|год|отопление|парковка|лифт|балкон|документ|депозит|предоплата|коммунальн|вид из окон|высота потолк|тип сделки|срок аренды|меблирован|бытовая техника|техника)/i;
+
+export function extractParamsFromHtml($) {
+  const lines = [];
+  $('li, p, div, span').each((_, el) => {
+    const $el = $(el);
+    if ($el.children().length > 3) return;
+    const text = $el.clone().find('style, script').remove().end().text().replace(/\s+/g, ' ').trim();
+    if (text.length < 5 || text.length > 90) return;
+    const m = text.match(/^([^:]{2,40}):\s*(\S.{0,50})$/);
+    if (!m || !PARAM_KEY_RE.test(m[1].trim())) return;
+    const line = `${m[1].trim()}: ${m[2].trim()}`;
+    if (!lines.includes(line)) lines.push(line);
+  });
+  return lines.slice(0, 25).join('\n');
+}
+
+/**
+ * Параметры из JSON API (Uybor/Joymee) — названия полей у API не
+ * подтверждены вживую, поэтому пробуем несколько вариантов и берём
+ * только правдоподобные числа.
+ */
+export function paramsTextFromApiItem(item) {
+  if (!item || typeof item !== 'object') return '';
+  const num = (...keys) => {
+    for (const k of keys) {
+      const v = Number(item[k]);
+      if (Number.isFinite(v) && v > 0) return v;
+    }
+    return null;
+  };
+  const floor = num('floor', 'floor_number', 'floorNumber');
+  const total = num('floors', 'floors_total', 'floorsTotal', 'floor_total', 'floorTotal', 'total_floors', 'building_floors');
+  const rooms = num('rooms', 'rooms_count', 'roomsCount', 'room_count');
+  const area = num('square', 'area', 'total_area', 'totalArea');
+  const out = [];
+  if (floor && floor <= 60) out.push(`Этаж: ${floor}`);
+  if (total && total <= 60) out.push(`Этажность: ${total}`);
+  if (rooms && rooms <= 20) out.push(`Количество комнат: ${rooms}`);
+  if (area && area < 2000) out.push(`Общая площадь: ${area} м²`);
+  return out.join('\n');
+}
+
+function paramValue(text, keyRe) {
+  const m = text.match(new RegExp(`(?:^|\\n)\\s*(?:${keyRe})[^:\\n]*:\\s*([^\\n]{1,50})`, 'i'));
+  return m ? m[1].trim() : null;
+}
+
+/** Этаж/этажность/комнаты/площадь из строк-параметров ("Этаж: 3"). */
+export function parseParams(paramsText) {
+  if (!paramsText) return {};
+  const num = (s) => {
+    const m = String(s || '').match(/\d+(?:[.,]\d+)?/);
+    return m ? Number(m[0].replace(',', '.')) : null;
+  };
+  const floor = num(paramValue(paramsText, 'этаж(?!ност|ей)'));
+  const floorsTotal = num(paramValue(paramsText, 'этажность|этажей'));
+  const rooms = num(paramValue(paramsText, 'количество комнат|комнат'));
+  const area = num(paramValue(paramsText, 'общая площадь|площадь(?! кухни)'));
+  return {
+    floor: floor >= 1 && floor <= 60 ? floor : null,
+    floorsTotal: floorsTotal >= 1 && floorsTotal <= 60 ? floorsTotal : null,
+    rooms: rooms >= 1 && rooms <= 20 ? rooms : null,
+    area: area > 0 && area < 2000 ? area : null,
+  };
+}
+
+/**
+ * Полезные факты из текста: ремонт, мебель, техника, комиссия,
+ * депозит, торг, документы и т.п. Только то, что реально найдено.
+ */
+export function extractFacts(listing) {
+  const params = listing.params_text || '';
+  const text = `${params}\n${listing.title || ''}\n${listing.raw_text || ''}`;
+  const low = text.toLowerCase();
+  const facts = [];
+
+  // Состояние
+  let condition = paramValue(params, 'ремонт|состояние');
+  if (!condition) {
+    if (/дизайнерск/.test(low)) condition = 'дизайнерский ремонт';
+    else if (/евро\s?ремонт|euro\s?remont|еврорем/.test(low)) condition = 'евроремонт';
+    else if (/требует\s+ремонт|без\s+ремонта|нужен\s+ремонт/.test(low)) condition = 'требует ремонта';
+    else if (/чернов|коробк|самоотделк|pesh/.test(low)) condition = 'черновая отделка';
+    else if (/косметическ/.test(low)) condition = 'косметический ремонт';
+    else if (/(?:с|после|свежий|капитальный)\s+ремонт|ремонтом|отремонтирован|jonli remont/.test(low)) condition = 'с ремонтом';
+  }
+  if (condition) facts.push(`Ремонт: ${condition.toLowerCase()}`);
+
+  // Мебель
+  const furnitureParam = paramValue(params, 'меблирован|мебел');
+  if (furnitureParam) {
+    facts.push(`Мебель: ${/^(да|есть|yes)/i.test(furnitureParam) ? 'есть' : /^(нет|no)/i.test(furnitureParam) ? 'нет' : furnitureParam.toLowerCase()}`);
+  } else if (/без\s+мебел|не\s+меблирован|пустая/.test(low)) facts.push('Мебель: нет');
+  else if (/с\s+мебел|меблирован|мебелью|мебель\s+есть|jihozlar|мебель\s+и\s+техник/.test(low)) facts.push('Мебель: есть');
+
+  // Техника
+  const appliances = [];
+  if (/кондиционер|conditsioner|konditsioner/.test(low)) appliances.push('кондиционер');
+  if (/холодильник|xolodilnik/.test(low)) appliances.push('холодильник');
+  if (/стиральн|kir yuvish/.test(low)) appliances.push('стиралка');
+  if (/телевизор|tv\b/.test(low)) appliances.push('ТВ');
+  if (/посудомоечн/.test(low)) appliances.push('посудомойка');
+  if (appliances.length) facts.push(`Техника: ${appliances.join(', ')}`);
+
+  // Здание/удобства
+  const extras = [];
+  if (/лифт/.test(low) && !/без\s+лифт|нет\s+лифт/.test(low)) extras.push('лифт');
+  if (/парковк|паркинг|гараж|avtoturargoh/.test(low)) extras.push('парковка');
+  if (/балкон|лоджи/.test(low)) extras.push('балкон');
+  if (/охран|закрыт(?:ая|ый)\s+(?:территори|двор)/.test(low)) extras.push('охрана');
+  if (/детск\w+\s+площадк/.test(low)) extras.push('детская площадка');
+  if (extras.length) facts.push(`Есть: ${extras.join(', ')}`);
+
+  // Метро/ориентир из текста
+  const metro = text.match(/метро\s+([А-ЯЁA-Z][\wА-Яа-яёЁ'’-]{2,25})|([А-ЯЁA-Z][\wА-Яа-яёЁ'’-]{2,25})\s+метро/);
+  const metroName = metro ? (metro[1] || metro[2]) : null;
+  if (metroName && !/^(рядом|возле|близко|от|до|у)$/i.test(metroName)) facts.push(`Метро: ${metroName}`);
+
+  // Условия
+  const deposit = text.match(/(?:депозит|залог|предоплат\w*)\s*[:\-–]?\s*([^\n.,;]{1,30})/i);
+  if (listing.deal_type === 'rent' && deposit) facts.push(`Депозит: ${deposit[1].trim()}`);
+  if (/без\s+комисси|безмаклер|без\s+маклер|без\s+посредник|от\s+хозяина|от\s+собственник|egasidan|vositachi\s+bo['’]?lmagan/.test(low)) {
+    facts.push('Без комиссии');
+  }
+  if (/торг\s+уместен|уместен\s+торг|возможен\s+торг|торг(?:\s+есть)?\b(?!\s+не)|kelishamiz/.test(low) && !/без\s+торг|торга\s+нет|торг\s+не/.test(low)) {
+    facts.push('Торг возможен');
+  }
+  if (listing.deal_type === 'sale') {
+    const docs = [];
+    if (/кадастр|купчая|купчей|kadastr/.test(low)) docs.push('купчая/кадастр');
+    if (/ипотек|ipoteka/.test(low)) docs.push('ипотека');
+    if (/рассрочк|bo['’]?lib\s+to['’]?lash/.test(low)) docs.push('рассрочка');
+    if (docs.length) facts.push(`Документы/оплата: ${docs.join(', ')}`);
+  }
+  if (/коммунальн\w*\s+(?:включен|входят|оплачивает\s+хозяин)/.test(low)) facts.push('Коммуналка включена');
+  if (/семье|для\s+семьи|oilaga/.test(low) && listing.deal_type === 'rent') facts.push('Для семьи');
+
+  return facts;
+}
+
+function toUsdApprox(value, currency) {
+  if (!value) return null;
+  return currency === 'UZS' ? value / EXCHANGE_RATE : currency === 'USD' ? value : null;
+}
+
+function spaced(n) {
+  return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ');
+}
+
+function formatPublished(publishedAt) {
+  if (!publishedAt) return null;
+  const d = new Date(publishedAt);
+  if (Number.isNaN(d.getTime())) return null;
+  const days = Math.floor((Date.now() - d.getTime()) / 86400000);
+  if (days <= 0) return 'сегодня';
+  if (days === 1) return 'вчера';
+  const dd = String(d.getDate()).padStart(2, '0');
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  return `${dd}.${mm}`;
+}
+
+/**
+ * Чистит описание с площадки для вставки в пост: убирает название,
+ * ссылки, телефоны, хештеги и лишние пробелы/переносы.
+ */
+export function cleanDescription(listing) {
+  let text = String(listing.raw_text || '');
+  if (!text) return '';
+  const title = String(listing.title || '').trim();
+  if (title && text.startsWith(title)) text = text.slice(title.length);
+  text = text
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\.css-[\w-]+\s*\{[^{}]*\}?/g, ' ')
+    .replace(/(?:\+?\d[\d\s().-]{7,}\d)/g, ' ') // телефоны
+    .replace(/#[\p{L}\d_]+/gu, ' ')
+    .replace(/^\s*Описание\s*/i, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\s*\n\s*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    // Остатки фраз после вырезанного телефона ("Звоните по телефону .")
+    .replace(/(?:звоните|звонить|позвоните|тел(?:ефон)?\.?|по\s+телефону|whatsapp|telegram|tel)(?:\s+(?:по\s+телефону|по\s+номеру))?\s*[:\-–]?\s*(?=[.,;!]|$)/gi, ' ')
+    .replace(/\s+([.,;!])/g, '$1')
+    .replace(/([.,;!])(?:\s*[.,;!])+/g, '$1')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return text;
+}
+
+function fitDescription(text, budget) {
+  if (!text || budget < 120) return '';
+  if (text.length <= budget) return text;
+  const cut = text.slice(0, budget - 1);
+  const sentence = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf('! '), cut.lastIndexOf('? '));
+  if (sentence > budget * 0.5) return cut.slice(0, sentence + 1);
+  const space = cut.lastIndexOf(' ');
+  return `${(space > budget * 0.5 ? cut.slice(0, space) : cut).replace(/[,;:\-–\s]+$/, '')}…`;
+}
+
 /**
  * Подпись поста. Только обычный текст (без parse_mode) — в ссылках
  * бывают & и _, которые ломают Markdown/HTML-разметку.
  */
 export function buildPostCaption(listing) {
-  const { floor, floorsTotal } = parseFloors(listing.title, listing.raw_text);
+  const fromText = parseFloors(listing.title, listing.raw_text);
+  const fromParams = parseParams(listing.params_text);
+  const floor = fromParams.floor ?? fromText.floor;
+  const floorsTotal = fromParams.floorsTotal ?? fromText.floorsTotal;
+  const rooms = listing.rooms ?? fromParams.rooms;
+  const areaValue = listing.area ?? fromParams.area;
 
   const segmentTag =
     listing.market_segment === 'new_build'
@@ -108,7 +321,6 @@ export function buildPostCaption(listing) {
   const dealTag = listing.deal_type === 'sale' ? '#продажа' : listing.deal_type === 'rent' ? '#аренда' : null;
   const typeTag =
     listing.property_type === 'house' ? '#дом' : listing.property_type === 'commercial' ? '#коммерция' : null;
-
   const headTags = [segmentTag, typeTag, dealTag].filter(Boolean).join(' ');
 
   const lines = ['🌟'];
@@ -117,31 +329,53 @@ export function buildPostCaption(listing) {
   lines.push('');
 
   const roomsLabel = listing.property_type === 'house' ? 'Комнат' : 'Комната';
-  if (listing.rooms) lines.push(`${roomsLabel}:${listing.rooms}`);
-  if (floor) lines.push(`Этаж:${floor}`);
-  if (floorsTotal) lines.push(`Этажность:${floorsTotal}`);
-  const area = formatArea(listing.area);
-  if (area) lines.push(`Площадь:${area}`);
-  // Пустая строка только если есть блок параметров
-  if (listing.rooms || floor || floorsTotal || area) lines.push('');
+  const paramLines = [];
+  if (rooms) paramLines.push(`${roomsLabel}:${rooms}`);
+  if (floor) paramLines.push(`Этаж:${floor}`);
+  if (floorsTotal) paramLines.push(`Этажность:${floorsTotal}`);
+  const area = formatArea(areaValue);
+  if (area) paramLines.push(`Площадь:${area}`);
+  if (paramLines.length) lines.push(...paramLines, '');
 
-  lines.push(`Цена : ${formatPrice(listing)}`);
+  const facts = extractFacts(listing);
+  if (facts.length) lines.push(...facts, '');
+
+  // Цена: в сумах добавляем примерный эквивалент в $, для продажи —
+  // цену за м².
+  let priceLine = `Цена : ${formatPrice(listing)}`;
+  if (listing.price_currency === 'UZS') {
+    const usd = toUsdApprox(listing.price_value, 'UZS');
+    if (usd) priceLine += ` (≈ ${spaced(usd)} $)`;
+  }
+  lines.push(priceLine);
+  if (listing.deal_type === 'sale' && listing.price_per_sqm && listing.price_currency) {
+    const perSqmUsd = toUsdApprox(Number(listing.price_per_sqm), listing.price_currency);
+    if (perSqmUsd) lines.push(`≈ ${spaced(perSqmUsd)} $/м²`);
+  }
+  const published = formatPublished(listing.published_at);
+  if (published) lines.push(`Опубликовано: ${published}`);
   lines.push('');
 
   const bottomTags = [
-    listing.rooms ? toHashtag(`${listing.rooms}ком`) : null,
+    rooms ? toHashtag(`${rooms}ком`) : null,
     listing.district ? toHashtag(listing.district) : null,
   ]
     .filter(Boolean)
     .join(' ');
-  if (bottomTags) lines.push(bottomTags);
-  lines.push('————————————————');
+  const tail = [];
+  if (bottomTags) tail.push(bottomTags);
+  tail.push('————————————————');
+  if (listing.seller_name) tail.push(`👤 ${listing.seller_name}`);
+  if (listing.phone) tail.push(`📞 ${listing.phone}`);
+  tail.push(`🔗 ${listing.url}`);
 
-  if (listing.seller_name) lines.push(`👤 ${listing.seller_name}`);
-  if (listing.phone) lines.push(`📞 ${listing.phone}`);
-  lines.push(`🔗 ${listing.url}`);
+  // Описание занимает всё, что осталось в лимите подписи (1024) —
+  // ссылка и телефон никогда не обрезаются.
+  const fixedLength = [...lines, ...tail].join('\n').length + 2 /* пустая строка */ + 4 /* "📝 " + запас */;
+  const description = fitDescription(cleanDescription(listing), CAPTION_LIMIT - fixedLength - 5);
+  if (description) lines.push(`📝 ${description}`, '');
 
-  return lines.join('\n');
+  return [...lines, ...tail].join('\n');
 }
 
 /**

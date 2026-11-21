@@ -10,6 +10,7 @@ import { fetchDomtutListings, fetchDomtutDetails } from './scrapers/domtut.js';
 // TODO там же.
 import { fetchJoymeeListings, fetchJoymeeDetails } from './scrapers/joymee.js';
 import { classifyListing, labelFor, SELLER_LISTINGS_AGENT_THRESHOLD } from './classify.js';
+import { parseParams } from './postFormat.js';
 import { notifyAlert, notifyToTopicGroup } from './telegram.js';
 import {
   getListingById,
@@ -280,6 +281,8 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       // так что тут его не перезаписываем.
       if (details?.locationDistrict && !item.raw_district) item.raw_district = details.locationDistrict;
       if (details?.imageUrl && !item.image_url) item.image_url = details.imageUrl;
+      // Параметры со страницы (этаж, площадь, ремонт…) — тоже только для поста
+      if (details?.paramsText) item.params_text = [item.params_text, details.paramsText].filter(Boolean).join('\n');
       // Все фото для альбома (в базу НЕ пишутся — см. saveListing в db.js)
       if (Array.isArray(details?.imageUrls) && details.imageUrls.length > (item.image_urls?.length || 0)) {
         item.image_urls = details.imageUrls;
@@ -575,8 +578,9 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
     // точечно в каждом месте отображения (webhook/сайт/telegram.js) —
     // так гарантированно нет источника, откуда это число могло бы
     // просочиться повторно.
-    const rooms = propertyType === 'commercial' ? null : (classification.rooms ?? llmInfo.rooms);
-    const area = classification.area ?? llmInfo.area_living;
+    const paramsFacts = parseParams(item.params_text);
+    const rooms = propertyType === 'commercial' ? null : (classification.rooms ?? llmInfo.rooms ?? paramsFacts.rooms ?? null);
+    const area = classification.area ?? llmInfo.area_living ?? paramsFacts.area ?? null;
 
     // Сегмент (новостройка/вторичка) — LLM как последний фолбэк, если
     // ни структурное поле сайта, ни regex (detectMarketSegment на

@@ -1,3 +1,4 @@
+import { paramsTextFromApiItem } from '../postFormat.js';
 import { getWithRetry } from '../http.js';
 import { detectMarketSegment } from '../marketSegment.js';
 
@@ -222,6 +223,7 @@ export async function fetchJoymeeListings(dealType = 'rent', propertyType = 'apa
       seller_name: sellerName,
       raw_district: rawDistrict,
       image_url: imageUrl,
+      params_text: paramsTextFromApiItem(item),
     });
   }
 
