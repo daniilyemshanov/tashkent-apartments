@@ -3,6 +3,7 @@ import { getWithRetry } from '../http.js';
 import { parsePrice } from '../priceParser.js';
 import { detectMarketSegment } from '../marketSegment.js';
 import { extractParamsFromHtml, extractImageUrlsFromHtml } from '../postFormat.js';
+import { extractCoordsFromHtml } from '../geoCoords.js';
 
 // Два раздела — аренда и продажа квартир по Ташкенту. Забираем ВСЕ
 // объявления в каждом, не только помеченные сайтом "от собственника"
@@ -525,6 +526,7 @@ export async function fetchOlxDetails(url, { skipPhone = false } = {}) {
     paramsText: extractParamsFromHtml($),
     pagePrice,
     marketSegment,
+    coords: extractCoordsFromHtml(html), // точка на карте со страницы (если есть); только для поста, в базу не пишется
   };
 }
 

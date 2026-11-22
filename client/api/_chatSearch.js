@@ -8,7 +8,8 @@ import { DISTRICTS } from '../src/districts.js';
 import { getUsdRate } from './_fx.js';
 
 const MAX_RESULTS = 8;
-const SNIPPET_CHARS = 500; // кусок описания: по нему ИИ судит о ремонте, этаже, документах
+const SNIPPET_CHARS = 500;
+const MIN_MARKET_SAMPLE = 8; // медиана по меньшей выборке — не основание для слов «дорого/дёшево» // кусок описания: по нему ИИ судит о ремонте, этаже, документах
 
 export const SEARCH_TOOL = {
   name: 'search_listings',
@@ -39,8 +40,8 @@ export const SEARCH_TOOL = {
 export const MARKET_TOOL = {
   name: 'market_stats',
   description:
-    'Медианная цена за м² в $ по районам из нашей базы (за последние ~45 дней) и размер выборки. ' +
-    'Вызывай, когда нужно оценить, дорого или дёшево объявление, или сравнить районы. Без district вернёт все районы.',
+    'Медианная цена за м² в $ по районам из НАШЕЙ базы за ~45 дней и размер выборки. Для вопросов про районы и сравнение районов. ' +
+    'Пустой ответ или sample < 8 означает, что данных нет и оценивать рынок нельзя. Для оценки конкретного объявления используй поле market из search_listings.',
   input_schema: {
     type: 'object',
     properties: {
@@ -96,6 +97,41 @@ function budgetFilter(a, rate) {
   return { or: `${part('USD', 1)},${part('UZS', rate)}` };
 }
 
+
+/**
+ * Сравнение цены за м² с медианой НАШЕЙ базы (market_stats, ~45 дней) считает код, а не модель:
+ * так ИИ не может «оценить рынок» там, где данных нет. Возвращает Map(id → {median_usd_m2, sample, vs_median_pct}).
+ * vs_median_pct > 0 — дороже медианы, < 0 — дешевле. Если выборка меньше MIN_MARKET_SAMPLE, сравнения нет.
+ */
+async function marketComparison(rows, usdM2ById) {
+  const deals = [...new Set(rows.map((r) => r.deal_type).filter(Boolean))];
+  const types = [...new Set(rows.map((r) => r.property_type).filter(Boolean))];
+  const out = new Map();
+  if (!deals.length || !types.length) return out;
+  const { data, error } = await supabase
+    .from('market_stats')
+    .select('group_key,median_price_per_sqm,sample_size')
+    .in('deal_type', deals)
+    .in('property_type', types)
+    .limit(600);
+  if (error || !data) return out;
+  const stats = new Map(data.map((r) => [r.group_key, r]));
+  for (const r of rows) {
+    const usdM2 = usdM2ById.get(r.id);
+    if (!usdM2) continue;
+    const base = `${r.property_type}|${r.deal_type}|${r.district}`;
+    // у объявления известен сегмент → сравниваем только с тем же сегментом; иначе с районом целиком
+    const st = r.market_segment ? stats.get(`${base}|${r.market_segment}`) : stats.get(base);
+    if (!st || !st.median_price_per_sqm || st.sample_size < MIN_MARKET_SAMPLE) continue;
+    out.set(r.id, {
+      median_usd_m2: round(Number(st.median_price_per_sqm), 10),
+      sample: st.sample_size,
+      vs_median_pct: Math.round((usdM2 / Number(st.median_price_per_sqm) - 1) * 100),
+    });
+  }
+  return out;
+}
+
 export async function searchListings(a = {}) {
   const fx = await getUsdRate();
   const rate = fx?.rate || null;
@@ -104,7 +140,7 @@ export async function searchListings(a = {}) {
     .from('listings')
     .select(
       'id,title,price,price_value,price_currency,district,rooms,area,label_kind,url,raw_text,image_url,published_at,created_at,' +
-        'price_per_sqm,below_market,below_market_pct,deal_score,market_segment,urgency_phrase,price_drop_count,last_price_change_pct,' +
+        'deal_type,property_type,price_per_sqm,below_market,below_market_pct,deal_score,market_segment,urgency_phrase,price_drop_count,last_price_change_pct,' +
         'telegram_chat_id,telegram_message_id,telegram_deleted'
     )
     .neq('is_duplicate', true)
@@ -158,6 +194,8 @@ export async function searchListings(a = {}) {
   if (!data?.length) return { count: 0, items: [], ...rateInfo, base: await baseCounts() };
 
   const toUsd = (v, cur) => (v == null ? null : cur === 'UZS' ? (rate ? v / rate : null) : v);
+  const usdM2ById = new Map(data.map((r) => [r.id, toUsd(r.price_per_sqm, r.price_currency)]));
+  const market = await marketComparison(data, usdM2ById);
   const items = data.map((r) => {
     const usd = toUsd(r.price_value, r.price_currency);
     const usdM2 = toUsd(r.price_per_sqm, r.price_currency);
@@ -167,6 +205,7 @@ export async function searchListings(a = {}) {
       price: r.price_value ? `${r.price_value} ${r.price_currency || ''}`.trim() : clip(r.price, 30),
       usd: round(usd, usd > 20000 ? 100 : 1),
       usd_m2: round(usdM2, 10),
+      market: market.get(r.id) || null, // нет поля market = сравнить с рынком НЕЛЬЗЯ (мало данных в нашей базе)
       area: r.area,
       rooms: r.rooms,
       district: r.district,
@@ -188,7 +227,7 @@ export async function searchListings(a = {}) {
   // links уходит не модели, а в карточки ответа (_aiChat.js вырезает это поле перед отправкой модели)
   const links = {};
   for (const r of data) links[r.id] = telegramPostLink(r);
-  return { count: items.length, items, ...rateInfo, links };
+  return { count: items.length, items, ...rateInfo, market_compared: items.filter((i) => i.market).length, links };
 }
 
 export async function marketStats(a = {}) {

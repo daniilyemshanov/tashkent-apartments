@@ -65,6 +65,7 @@ function linkLine(card) {
   const parts = [];
   if (/^https?:\/\//.test(card.url || '')) parts.push(`🔗 <a href="${attr(card.url)}">${escapeHtml(hostLabel(card.url))}</a>`);
   if (card.tg) parts.push(`💬 <a href="${attr(card.tg)}">Пост в группе</a>`);
+  if (card.map) parts.push(`📍 <a href="${attr(card.map)}">На карте</a>`);
   return parts.join('  ·  ');
 }
 
@@ -78,15 +79,15 @@ function formatAnswer(replyRaw, cards, firstTurn) {
   let raw = replyRaw;
   if (raw.length > MAX_TG_BODY) {
     raw = raw.slice(0, MAX_TG_BODY);
-    raw = raw.slice(0, Math.max(raw.lastIndexOf('\n'), 0) || MAX_TG_BODY).replace(/\[id:[^\]]*$/, '') + '…';
+    raw = raw.slice(0, Math.max(raw.lastIndexOf('\n'), 0) || MAX_TG_BODY).replace(/\[(?:id|map):[^\]]*$/, '') + '…';
   }
   let body = escapeHtml(raw);
-  body = body.replace(/[ \t]*\[id:([\w.-]+)\]/g, (_, id) => {
+  body = body.replace(/[ \t]*\[id:([\w.-]+)\](?:\s*\[map:[^\]]*\])?/g, (_, id) => {
     const card = byId.get(id);
     const line = card && linkLine(card);
     return line ? `\n${line}` : '';
   });
-  body = body.replace(/\n{3,}/g, '\n\n').trim();
+  body = body.replace(/[ \t]*\[map:[^\]]*\]/g, '').replace(/\n{3,}/g, '\n\n').trim();
   if (firstTurn) body += '\n\n<i>Продолжайте, отвечая (Reply) на это сообщение. Начать заново: /ai новый</i>';
   return body;
 }

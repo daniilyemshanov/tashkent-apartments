@@ -1,6 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { getTopicId, getExtraMessageIds } from './db.js';
 import { getDistrictCoords } from './geo.js';
+import { coordsCaption } from './geoCoords.js';
 import { buildPostCaption, collectPhotos } from './postFormat.js';
 import { cleanPhoto, cleanPhotos } from './imageClean.js';
 
@@ -272,7 +273,9 @@ async function sendListingPost(targetChatId, listing, extraOpts, buttons) {
   // текстовое сообщение с теми же кнопками.
   const markup = { inline_keyboard: buttons };
   let control = null;
-  const coords = getDistrictCoords(listing.district);
+  // Точка со страницы объявления (если площадка её отдала) точнее центра района
+  const exact = listing.geo_coords && Number.isFinite(listing.geo_coords.lat) && Number.isFinite(listing.geo_coords.lng) ? listing.geo_coords : null;
+  const coords = exact ? [exact.lat, exact.lng] : getDistrictCoords(listing.district);
   if (coords) {
     try {
       control = await bot.sendVenue(
@@ -280,7 +283,7 @@ async function sendListingPost(targetChatId, listing, extraOpts, buttons) {
         coords[0],
         coords[1],
         `📍 ${listing.district}`,
-        'примерно, на месте уточним',
+        exact ? coordsCaption(exact) : 'примерно, на месте уточним',
         { reply_markup: markup, ...extraOpts }
       );
     } catch (err) {

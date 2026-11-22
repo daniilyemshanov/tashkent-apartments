@@ -284,6 +284,8 @@ async function processSource(fetchList, fetchDetails, sourceName, dealType, fetc
       // так что тут его не перезаписываем.
       if (details?.locationDistrict && !item.raw_district) item.raw_district = details.locationDistrict;
       if (details?.imageUrl && !item.image_url) item.image_url = details.imageUrl;
+      // Координаты со страницы — только для пина в посте (в базу не пишутся, см. saveListing в db.js)
+      if (details?.coords && !item.geo_coords) item.geo_coords = details.coords;
       // Параметры со страницы (этаж, площадь, ремонт…) — тоже только для поста
       if (details?.paramsText) item.params_text = [item.params_text, details.paramsText].filter(Boolean).join('\n');
       // Все фото для альбома (в базу НЕ пишутся — см. saveListing в db.js)

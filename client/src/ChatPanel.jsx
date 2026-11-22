@@ -91,6 +91,7 @@ export default function ChatPanel({ authFetch, onClose }) {
                       <div className="chat-card-links">
                         {c.url && <a href={c.url} target="_blank" rel="noreferrer">🔗 Объявление</a>}
                         {c.tg && <a href={c.tg} target="_blank" rel="noreferrer">💬 Пост в группе</a>}
+                        {c.map && <a href={c.map} target="_blank" rel="noreferrer">📍 На карте</a>}
                       </div>
                     </div>
                   </div>

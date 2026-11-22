@@ -115,7 +115,7 @@ export async function saveListing(listing, previousListing = null) {
     : { contacted: false };
   // image_urls — только для альбома в Telegram, колонки в базе нет
   // (в памяти у listing поле остаётся, отправка идёт после сохранения).
-  const { image_urls: _imageUrls, params_text: _paramsText, ...listingForDb } = listing;
+  const { image_urls: _imageUrls, params_text: _paramsText, geo_coords: _geoCoords, ...listingForDb } = listing;
   const payload = { ...listingForDb, ...preserved };
   const { error } = await supabase.from('listings').upsert(payload, { onConflict: 'id' });
   if (error) {
